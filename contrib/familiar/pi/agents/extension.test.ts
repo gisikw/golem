@@ -14,6 +14,7 @@ describe("Familiar Presence extension", () => {
   test("uses Golem transport and retains provider/artifact job output", () => {
     expect(source).toContain("process.env.GOLEM_CLI");
     expect(source).toContain("process.env.GOLEM_ENDPOINT");
+    expect(source).toContain("`${pluginRoot}#golem`");
     expect(source).toContain("--provider-config");
     expect(source).toContain("details: value");
   });

@@ -11,7 +11,11 @@ import {
 // Thin transport bridge to the independently deployable Golem.
 // supervised service endpoint is supplied through the
 // same GOLEM_ENDPOINT consumed by the CLI and this extension.
-const CLI = process.env.GOLEM_CLI || "golem";
+const pluginRoot = process.env.FAMILIAR_PLUGIN_ROOT;
+const CLI = process.env.GOLEM_CLI || (pluginRoot ? "nix" : "golem");
+const CLI_PREFIX = !process.env.GOLEM_CLI && pluginRoot
+  ? ["run", `${pluginRoot}#golem`, "--"]
+  : [];
 const ENDPOINT = process.env.GOLEM_ENDPOINT || "http://127.0.0.1:7337";
 const DEFAULT_HOST = process.env.GOLEM_HOST;
 const MAX_OUTPUT = 2 * 1024 * 1024;
@@ -26,7 +30,7 @@ const invoke = (args: string[], signal?: AbortSignal): Promise<ToolResult> =>
   new Promise((resolve) => {
     execFile(
       CLI,
-      ["--service", ENDPOINT, "--json", ...args],
+      [...CLI_PREFIX, "--service", ENDPOINT, "--json", ...args],
       { encoding: "utf8", maxBuffer: MAX_OUTPUT, signal },
       (error, stdout, stderr) => {
         if (error) {
