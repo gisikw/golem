@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -129,6 +130,92 @@ type TerminalEndpoint struct {
 // Builtin+CopyAuth and the adapter copies auth.json into the private per-job dir
 // (0700/0600). See DECISIONS.md #20 for the credential-exposure note and
 // the remote-host caveat.
+// ValidateProviderConfig enforces the secret-reference contract before a
+// provider descriptor can cross the service persistence boundary. ModelsJSON
+// is intentionally limited to one provider entry, matching the worker's
+// single-provider provisioning behavior.
+func ValidateProviderConfig(pc *ProviderConfig) error {
+	if pc == nil || len(pc.ModelsJSON) == 0 {
+		return nil
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(pc.ModelsJSON, &document); err != nil || document == nil {
+		return errors.New("provider config models_json must be a JSON object")
+	}
+	rawProviders, ok := document["providers"]
+	if !ok {
+		return errors.New("provider config models_json must contain providers")
+	}
+	var providers map[string]json.RawMessage
+	if err := json.Unmarshal(rawProviders, &providers); err != nil || len(providers) != 1 {
+		return errors.New("provider config models_json must contain exactly one provider")
+	}
+	raw, ok := providers[pc.Provider]
+	if !ok {
+		return errors.New("provider config provider does not match models_json")
+	}
+	var entry map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &entry); err != nil || entry == nil {
+		return errors.New("provider config provider entry must be a JSON object")
+	}
+	var all any
+	if err := json.Unmarshal(pc.ModelsJSON, &all); err != nil {
+		return errors.New("provider config models_json contains invalid JSON")
+	}
+	if err := validateSecretReferences(all); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSecretReferences(v any) error {
+	switch x := v.(type) {
+	case map[string]any:
+		for key, child := range x {
+			normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", ""))
+			if normalized == "apikey" || normalized == "credential" || normalized == "credentials" {
+				value, ok := child.(string)
+				if !ok || !isSecretReference(value) {
+					return errors.New("provider config secret fields must be unresolved references")
+				}
+				continue
+			}
+			if err := validateSecretReferences(child); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, child := range x {
+			if err := validateSecretReferences(child); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func isSecretReference(value string) bool {
+	if strings.HasPrefix(value, "!") {
+		return len(strings.TrimSpace(value[1:])) > 0
+	}
+	if strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") {
+		return validEnvName(value[2 : len(value)-1])
+	}
+	return strings.HasPrefix(value, "$") && validEnvName(value[1:])
+}
+
+func validEnvName(value string) bool {
+	if value == "" || (value[0] != '_' && (value[0] < 'A' || value[0] > 'Z') && (value[0] < 'a' || value[0] > 'z')) {
+		return false
+	}
+	for _, r := range value[1:] {
+		if r != '_' && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
 type ProviderConfig struct {
 	// Provider and Model are the canonical ids used for defaults and for scoping
 	// the worker to a single model (enabledModels "provider/model").

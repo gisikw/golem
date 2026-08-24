@@ -24,8 +24,8 @@ func env(key, fallback string) string {
 	return fallback
 }
 func main() {
-	db := flag.String("db", env("GOLEM_DB", "agents.db"), "SQLite database path")
-	socket := flag.String("unix", env("GOLEM_SOCKET", "agents.sock"), "Unix socket; empty disables")
+	db := flag.String("db", env("GOLEM_DB", "golem.db"), "SQLite database path")
+	socket := flag.String("unix", env("GOLEM_SOCKET", "golem.sock"), "Unix socket; empty disables")
 	listen := flag.String("listen", env("GOLEM_LISTEN", "127.0.0.1:7337"), "loopback HTTP address; empty disables")
 	flag.Parse()
 	store, err := service.Open(*db)

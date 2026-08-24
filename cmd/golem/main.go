@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/gisikw/golem/client"
@@ -72,8 +73,9 @@ func main() {
 		var pc *protocol.ProviderConfig
 		if *providerConfig != "" {
 			pc = &protocol.ProviderConfig{}
-			if err := json.Unmarshal([]byte(*providerConfig), pc); err != nil {
-				fatal(fmt.Errorf("invalid --provider-config: %w", err))
+			if err := json.Unmarshal([]byte(*providerConfig), pc); err != nil || protocol.ValidateProviderConfig(pc) != nil {
+				// Do not echo the supplied JSON: it may contain a credential.
+				fatal(errors.New("invalid --provider-config"))
 			}
 		}
 		j, e := c.Create(ctx, protocol.CreateJob{IdempotencyKey: *key, Harness: protocol.HarnessKind(*h), Model: *model, ProviderConfig: pc, CWD: abs, Isolation: iso, Prompt: strings.Join(f.Args(), " "), Host: *host})

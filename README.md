@@ -77,7 +77,7 @@ Use global `--json` for machine-readable output.
 
 Service variables:
 
-- `GOLEM_DB`, `GOLEM_SOCKET`, `GOLEM_LISTEN`
+- `GOLEM_DB`, `GOLEM_SOCKET`, `GOLEM_LISTEN` (defaults: `golem.db`, `golem.sock`, and `127.0.0.1:7337`)
 
 Supervisor variables:
 

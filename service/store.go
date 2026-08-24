@@ -71,6 +71,9 @@ func (s *Store) Create(ctx context.Context, c protocol.CreateJob) (protocol.Job,
 	if c.Isolation != protocol.IsolationNone && c.Isolation != protocol.IsolationWorktree {
 		return protocol.Job{}, errors.New("invalid isolation policy")
 	}
+	if err := protocol.ValidateProviderConfig(c.ProviderConfig); err != nil {
+		return protocol.Job{}, err
+	}
 	now := time.Now().UTC()
 	id, err := newID("job")
 	if err != nil {
