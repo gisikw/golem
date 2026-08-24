@@ -34,6 +34,7 @@
         packages = { inherit cli service supervisor familiar-render; default = cli; };
         apps = {
           default = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
+          golem = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
           golem-service = { type = "app"; program = "${service}/bin/golem-service"; };
           golem-supervisor = { type = "app"; program = "${supervisor}/bin/golem-supervisor"; };
           golem-familiar-render = { type = "app"; program = "${familiar-render}/bin/golem-familiar-render"; };
