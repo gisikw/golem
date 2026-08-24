@@ -23,8 +23,8 @@ probe = { type = "http", url = "http://127.0.0.1:7340/live" }
 [pi]
 extensions = ["${plugin_root}/contrib/familiar/pi/agents"]
 
-[render]
-target = "left-nav"
+[pi.env]
+GOLEM_CLI_ARGV_JSON = "[\"nix\", \"run\", \"${plugin_root}#golem\", \"--\"]"
+
+[chrome]
 render_url = "http://127.0.0.1:7340/v1/render"
-ttl_ms = 30000
-invalidate_url_env = "FAMILIAR_RENDER_INVALIDATE_URL"

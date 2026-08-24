@@ -49,7 +49,7 @@
           familiar-extension = pkgs.runCommand "golem-familiar-extension-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
             cp -r ${./contrib/familiar} ./familiar
             chmod -R u+w ./familiar
-            bun test ./familiar/pi/agents/resolve.test.ts ./familiar/pi/agents/extension.test.ts ./familiar/manifest.test.ts
+            bun test ./familiar/pi/agents/resolve.test.ts ./familiar/pi/agents/cli.test.ts ./familiar/pi/agents/extension.test.ts ./familiar/manifest.test.ts
             touch $out
           '';
         };

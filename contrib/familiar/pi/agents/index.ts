@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { execFile } from "node:child_process";
+import { appendGolemToolArgs, parseGolemCliArgv } from "./cli.ts";
 import {
   buildProviderConfig,
   type ModelDescriptor,
@@ -11,11 +12,7 @@ import {
 // Thin transport bridge to the independently deployable Golem.
 // supervised service endpoint is supplied through the
 // same GOLEM_ENDPOINT consumed by the CLI and this extension.
-const pluginRoot = process.env.FAMILIAR_PLUGIN_ROOT;
-const CLI = process.env.GOLEM_CLI || (pluginRoot ? "nix" : "golem");
-const CLI_PREFIX = !process.env.GOLEM_CLI && pluginRoot
-  ? ["run", `${pluginRoot}#golem`, "--"]
-  : [];
+const CLI = parseGolemCliArgv();
 const ENDPOINT = process.env.GOLEM_ENDPOINT || "http://127.0.0.1:7337";
 const DEFAULT_HOST = process.env.GOLEM_HOST;
 const MAX_OUTPUT = 2 * 1024 * 1024;
@@ -28,9 +25,17 @@ type ToolResult = {
 
 const invoke = (args: string[], signal?: AbortSignal): Promise<ToolResult> =>
   new Promise((resolve) => {
+    if ("error" in CLI) {
+      resolve({
+        content: [{ type: "text", text: JSON.stringify({ ok: false, error: CLI.error }) }],
+        details: { ok: false, error: CLI.error },
+        isError: true,
+      });
+      return;
+    }
     execFile(
-      CLI,
-      [...CLI_PREFIX, "--service", ENDPOINT, "--json", ...args],
+      CLI.argv[0],
+      appendGolemToolArgs(CLI.argv.slice(1), ENDPOINT, args),
       { encoding: "utf8", maxBuffer: MAX_OUTPUT, signal },
       (error, stdout, stderr) => {
         if (error) {
