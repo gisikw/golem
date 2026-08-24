@@ -25,21 +25,21 @@
             wrapProgram $out/bin/golem-supervisor --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.bash ]}
           '';
         });
-        familiar-nav = (build "golem-familiar-nav" [ "./cmd/golem-familiar-nav" ]).overrideAttrs (old: {
+        familiar-render = (build "golem-familiar-render" [ "./cmd/golem-familiar-render" ]).overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
-            wrapProgram $out/bin/golem-familiar-nav --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux ]}
+            wrapProgram $out/bin/golem-familiar-render --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux ]}
           '';
         });
       in {
-        packages = { inherit cli service supervisor familiar-nav; default = cli; };
+        packages = { inherit cli service supervisor familiar-render; default = cli; };
         apps = {
           default = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
           golem-service = { type = "app"; program = "${service}/bin/golem-service"; };
           golem-supervisor = { type = "app"; program = "${supervisor}/bin/golem-supervisor"; };
-          golem-familiar-nav = { type = "app"; program = "${familiar-nav}/bin/golem-familiar-nav"; };
+          golem-familiar-render = { type = "app"; program = "${familiar-render}/bin/golem-familiar-render"; };
         };
         checks = {
-          inherit cli service supervisor familiar-nav;
+          inherit cli service supervisor familiar-render;
           agent-hooks = pkgs.runCommand "golem-agent-hooks-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
             cp -r ${./integrations/pi/agent-hooks} ./agent-hooks
             chmod -R u+w ./agent-hooks
