@@ -116,7 +116,7 @@ func Project(ctx context.Context, jobs []protocol.Job, live LiveFunc) Node {
 		children := byBranch[label]
 		branches = append(branches, Node{Kind: "branch", ID: "workspace:" + label, Label: label, Children: &children})
 	}
-	return Node{Kind: "tree", ID: "golem:jobs", Children: &branches}
+	return Node{Kind: "tree", ID: "golem:jobs", Label: "agents", Children: &branches}
 }
 
 func label(prompt, id string) string {
@@ -163,7 +163,7 @@ type Server struct {
 
 func New(source JobSource, live LiveFunc, invalidate InvalidateFunc, ttl time.Duration) *Server {
 	children := []Node{}
-	root := Node{Kind: "tree", ID: "golem:jobs", Children: &children}
+	root := Node{Kind: "tree", ID: "golem:jobs", Label: "agents", Children: &children}
 	return &Server{source: source, live: live, invalidate: invalidate, doc: Document{RenderAPI: RenderAPI, Revision: 1, TTLMillis: ttl.Milliseconds(), Target: RenderTarget, Content: root}}
 }
 func (s *Server) Refresh(ctx context.Context) error {

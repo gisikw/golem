@@ -11,9 +11,14 @@ describe("Familiar Presence extension", () => {
     ]);
     expect(new Set(names).size).toBe(names.length);
   });
-  test("uses Golem transport and retains provider/artifact job output", () => {
-    expect(source).toContain("process.env.GOLEM_CLI");
+  test("uses the host-owned argv transport and retains provider/artifact job output", () => {
+    expect(source).toContain("parseGolemCliArgv");
     expect(source).toContain("process.env.GOLEM_ENDPOINT");
+    expect(source).toContain("execFile(");
+    expect(source).toContain("CLI.argv[0]");
+    expect(source).not.toContain('"golem"');
+    expect(source).not.toContain("FAMILIAR_PLUGIN_ROOT");
+    expect(source).not.toContain("nix");
     expect(source).toContain("--provider-config");
     expect(source).toContain("details: value");
   });

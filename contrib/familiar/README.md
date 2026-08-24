@@ -24,8 +24,10 @@ rev = "0123456789abcdef0123456789abcdef01234567"
 ```
 
 The Familiar host owns source checkout, exact API validation, service lifecycle,
-and `${plugin_root}` expansion. No other manifest interpolation is required.
-Plugin service environment is passed through verbatim. At minimum set
+`${plugin_root}` expansion, and validation of the Golem executable argv declared
+by `GOLEM_CLI_ARGV_JSON` under `[pi.env]`. It injects that resolved argv JSON into
+Presence; the Presence extension never falls back to PATH or resolves the plugin
+itself. Plugin service environment is passed through verbatim. At minimum set
 `GOLEM_DB`, `GOLEM_SOCKET`, `GOLEM_SUPERVISOR_STATE`, and `GOLEM_HOST` as needed.
 Set `GOLEM_WEB_EXTENSION` to the host's generic Pi web extension path; Golem does
 not copy or own that Familiar code. The host continues to load that extension

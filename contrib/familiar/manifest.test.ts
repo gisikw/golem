@@ -10,11 +10,12 @@ test("manifest is exact v1 and points only into the Golem contribution", () => {
   for (const app of ["golem-service", "golem-supervisor", "golem-familiar-render"])
     expect(manifest).toContain(`\${plugin_root}#${app}`);
   expect(manifest).toContain('"${plugin_root}/contrib/familiar/pi/agents"');
-  expect(manifest).toContain('[render]');
-  expect(manifest).toContain('target = "left-nav"');
+  expect(manifest).toContain('[chrome]');
   expect(manifest).toContain('render_url = "http://127.0.0.1:7340/v1/render"');
-  expect(manifest).toContain('ttl_ms = 30000');
-  expect(manifest).toContain('invalidate_url_env = "FAMILIAR_RENDER_INVALIDATE_URL"');
+  expect(manifest).toContain('[pi.env]');
+  expect(manifest).toContain('GOLEM_CLI_ARGV_JSON = "[\\"nix\\", \\"run\\", \\"${plugin_root}#golem\\", \\"--\\"]"');
+  expect(manifest).not.toContain('[render]');
+  expect(manifest).not.toContain('[nav]');
   expect(manifest).not.toContain('snapshot_url');
   expect(manifest).not.toContain('updates_url');
 });
