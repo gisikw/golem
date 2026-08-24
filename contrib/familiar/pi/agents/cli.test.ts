@@ -6,7 +6,11 @@ describe("host-owned Golem CLI argv", () => {
     for (const raw of [undefined, "not json", "[]", "[1]", "[\"  \"]"]) {
       const result = parseGolemCliArgv(raw);
       expect("error" in result).toBe(true);
-      if ("error" in result) expect(result.error).not.toContain(raw ?? "");
+      if ("error" in result && raw === undefined) {
+        expect(result.error).toBe("Golem CLI configuration is missing (GOLEM_CLI_ARGV_JSON)");
+      } else if ("error" in result) {
+        expect(result.error).not.toContain(raw);
+      }
     }
   });
 
