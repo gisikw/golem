@@ -1,0 +1,30 @@
+familiar_api = 1
+
+[[services]]
+name = "golem-service"
+argv = ["nix", "run", "${plugin_root}#golem-service"]
+required = false
+probe = { type = "http", url = "http://127.0.0.1:7337/ready" }
+
+[[services]]
+name = "golem-supervisor"
+argv = ["nix", "run", "${plugin_root}#golem-supervisor"]
+depends_on = ["golem-service"]
+required = false
+env = { GOLEM_HOOK_EXTENSION = "${plugin_root}/integrations/pi/agent-hooks/index.ts" }
+
+[[services]]
+name = "golem-familiar-render"
+argv = ["nix", "run", "${plugin_root}#golem-familiar-render"]
+depends_on = ["golem-service"]
+required = false
+probe = { type = "http", url = "http://127.0.0.1:7340/live" }
+
+[pi]
+extensions = ["${plugin_root}/contrib/familiar/pi/agents"]
+
+[render]
+target = "left-nav"
+render_url = "http://127.0.0.1:7340/v1/render"
+ttl_ms = 30000
+invalidate_url_env = "FAMILIAR_RENDER_INVALIDATE_URL"
