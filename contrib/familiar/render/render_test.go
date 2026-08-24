@@ -35,7 +35,7 @@ func TestProjectTreeOrderLabelsAndLiveTerminal(t *testing.T) {
 		return endpoint.Target == "worker-job-a:0.0"
 	})
 	branches := children(root)
-	if root.Kind != "tree" || root.ID != "golem:jobs" || len(branches) != 2 {
+	if root.Kind != "tree" || root.ID != "golem:jobs" || root.Label != "agents" || len(branches) != 2 {
 		t.Fatalf("root = %#v", root)
 	}
 	if branches[0].Kind != "branch" || branches[0].Label != "alpha" || branches[1].Label != "zeta" {
