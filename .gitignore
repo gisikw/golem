@@ -1,0 +1,6 @@
+.direnv/
+.env
+*.db
+*.db-*
+*.sock
+result
