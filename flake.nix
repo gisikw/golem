@@ -25,15 +25,31 @@
             wrapProgram $out/bin/golem-supervisor --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.bash ]}
           '';
         });
+        familiar-nav = (build "golem-familiar-nav" [ "./cmd/golem-familiar-nav" ]).overrideAttrs (old: {
+          postInstall = (old.postInstall or "") + ''
+            wrapProgram $out/bin/golem-familiar-nav --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux ]}
+          '';
+        });
       in {
-        packages = { inherit cli service supervisor; default = cli; };
-        apps.default = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
+        packages = { inherit cli service supervisor familiar-nav; default = cli; };
+        apps = {
+          default = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
+          golem-service = { type = "app"; program = "${service}/bin/golem-service"; };
+          golem-supervisor = { type = "app"; program = "${supervisor}/bin/golem-supervisor"; };
+          golem-familiar-nav = { type = "app"; program = "${familiar-nav}/bin/golem-familiar-nav"; };
+        };
         checks = {
-          inherit cli service supervisor;
+          inherit cli service supervisor familiar-nav;
           agent-hooks = pkgs.runCommand "golem-agent-hooks-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
             cp -r ${./integrations/pi/agent-hooks} ./agent-hooks
             chmod -R u+w ./agent-hooks
             bun test ./agent-hooks/events.test.ts
+            touch $out
+          '';
+          familiar-extension = pkgs.runCommand "golem-familiar-extension-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
+            cp -r ${./contrib/familiar} ./familiar
+            chmod -R u+w ./familiar
+            bun test ./familiar/pi/agents/resolve.test.ts ./familiar/pi/agents/extension.test.ts ./familiar/manifest.test.ts
             touch $out
           '';
         };
