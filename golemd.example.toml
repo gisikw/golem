@@ -1,0 +1,24 @@
+# golemd operator configuration. Model IDs are opaque and nested under the
+# harness that offers them.
+name = "local"
+clone_enabled = false
+api_bearer_tokens = [] # Declared for future enforcement.
+
+[harnesses.fake]
+models = []
+
+[harnesses.pi]
+models = ["openai/gpt-5.6"]
+
+[harnesses.claude]
+models = ["anthropic/claude-sonnet-4"]
+
+# Project paths must be absolute existing directories. Project-based workspace
+# selection is planned for Phase 2; Phase 1 advertises this catalog only.
+[projects.scratch]
+path = "/tmp"
+description = "Local scratch space"
+
+# Declared for the future SSH attach daemon; no listener is started in Phase 1.
+[attach_ssh]
+port = 0

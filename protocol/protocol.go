@@ -84,6 +84,24 @@ func ValidateTransition(from, to State, hasSettlement bool) error {
 type HarnessKind string
 type IsolationPolicy string
 
+type HarnessCapability struct {
+	Models []string `json:"models"`
+}
+
+type ProjectCapability struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+type Capabilities struct {
+	Name         string                       `json:"name"`
+	Version      string                       `json:"version"`
+	Harnesses    map[string]HarnessCapability `json:"harnesses"`
+	Projects     []ProjectCapability          `json:"projects"`
+	CloneEnabled bool                         `json:"clone_enabled"`
+	AttachPort   int                          `json:"attach_port"`
+}
+
 const (
 	HarnessPi         HarnessKind     = "pi"
 	HarnessClaude     HarnessKind     = "claude"

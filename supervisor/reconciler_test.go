@@ -21,7 +21,7 @@ func testSupervisor(t *testing.T, cwd, artifactRoot string) (*Supervisor, *servi
 	if err != nil {
 		t.Fatal(err)
 	}
-	httpServer := httptest.NewServer(service.API{Store: store}.Handler())
+	httpServer := httptest.NewServer(service.API{Store: store, Capabilities: protocol.Capabilities{Name: "host", Harnesses: map[string]protocol.HarnessCapability{"fake": {}, "unknown": {}}}}.Handler())
 	t.Cleanup(httpServer.Close)
 	t.Cleanup(func() { _ = store.Close() })
 	registry, err := OpenRegistry(filepath.Join(t.TempDir(), "workers.json"))

@@ -2,7 +2,7 @@
 
 This directory is Golem's small, versioned integration surface for a Familiar
 host. It is not a plugin SDK. `plugin.toml` requires exactly `familiar_api = 1`,
-starts the existing Golem service and supervisor plus a semantic render adapter,
+starts the standalone golemd plus a semantic render adapter,
 and loads the Presence-side `agents_*` Pi tools.
 
 ## Enrollment
@@ -27,9 +27,9 @@ The Familiar host owns source checkout, exact API validation, service lifecycle,
 `${plugin_root}` expansion, and validation of the Golem executable argv declared
 by `GOLEM_CLI_ARGV_JSON` under `[pi.env]`. It injects that resolved argv JSON into
 Presence; the Presence extension never falls back to PATH or resolves the plugin
-itself. Plugin service environment is passed through verbatim. At minimum set
-`GOLEM_DB`, `GOLEM_SOCKET`, `GOLEM_SUPERVISOR_STATE`, and `GOLEM_HOST` as needed.
-Set `GOLEM_WEB_EXTENSION` to the host's generic Pi web extension path; Golem does
+itself. Plugin service environment is passed through verbatim. The manifest starts
+`golemd` with the checked-in example operator config and a loopback listener;
+operators may substitute their own config and state arguments. Set `GOLEM_WEB_EXTENSION` to the host's generic Pi web extension path; Golem does
 not copy or own that Familiar code. The host continues to load that extension
 for Presence independently. `GOLEM_ENDPOINT`, `GOLEM_LISTEN`,
 `GOLEM_RENDER_LISTEN`, and other existing Golem environment variables retain

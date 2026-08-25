@@ -41,7 +41,6 @@ CREATE TABLE IF NOT EXISTS jobs (
  state TEXT NOT NULL, body BLOB NOT NULL, created TEXT NOT NULL, updated TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
-CREATE INDEX IF NOT EXISTS jobs_host ON jobs(host);
 CREATE TABLE IF NOT EXISTS events (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), body BLOB NOT NULL, created TEXT NOT NULL
 );
@@ -62,8 +61,13 @@ func (s *Store) Close() error                    { return s.db.Close() }
 func (s *Store) Ready(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 func (s *Store) Create(ctx context.Context, c protocol.CreateJob) (protocol.Job, error) {
-	if c.IdempotencyKey == "" || c.Harness == "" || c.Host == "" || c.Prompt == "" || c.CWD == "" {
-		return protocol.Job{}, errors.New("idempotency_key, harness, host, cwd, and prompt are required")
+	if c.IdempotencyKey == "" || c.Harness == "" || c.Prompt == "" || c.CWD == "" {
+		return protocol.Job{}, errors.New("idempotency_key, harness, cwd, and prompt are required")
+	}
+	// Host remains in the persisted schema to avoid a destructive migration, but
+	// it is identity metadata rather than an assignment key.
+	if c.Host == "" {
+		c.Host = "local"
 	}
 	if c.Isolation == "" {
 		c.Isolation = protocol.IsolationNone
@@ -216,11 +220,10 @@ func (s *Store) Answer(ctx context.Context, id string, a protocol.Answer) (proto
 	})
 }
 
-func (s *Store) Poll(ctx context.Context, host string) (protocol.PollResponse, error) {
-	// Terminal jobs normally disappear from desired assignments. An explicit
-	// reap request is retained just long enough for the owning supervisor to
-	// destroy its host-local lingering tmux session.
-	rows, err := s.db.QueryContext(ctx, `SELECT body FROM jobs WHERE host=? AND (state NOT IN ('done','failed','cancelled','timeout') OR json_extract(body, '$.reap_requested')=1) ORDER BY created`, host)
+func (s *Store) Poll(ctx context.Context) (protocol.PollResponse, error) {
+	// Every non-terminal job belongs to this daemon. An explicit reap request is
+	// retained just long enough to destroy its lingering tmux session.
+	rows, err := s.db.QueryContext(ctx, `SELECT body FROM jobs WHERE state NOT IN ('done','failed','cancelled','timeout') OR json_extract(body, '$.reap_requested')=1 ORDER BY created`)
 	if err != nil {
 		return protocol.PollResponse{}, err
 	}
@@ -243,9 +246,6 @@ func (s *Store) Poll(ctx context.Context, host string) (protocol.PollResponse, e
 // Record atomically deduplicates each observed event and stores both settlement
 // ownership and the resulting terminal job state. Partial batches roll back.
 func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
-	if batch.Host == "" {
-		return errors.New("host is required")
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -263,7 +263,7 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 			continue
 		}
 		var raw []byte
-		if err = tx.QueryRowContext(ctx, "SELECT body FROM jobs WHERE id=? AND host=?", ev.JobID, batch.Host).Scan(&raw); err != nil {
+		if err = tx.QueryRowContext(ctx, "SELECT body FROM jobs WHERE id=?", ev.JobID).Scan(&raw); err != nil {
 			return err
 		}
 		var j protocol.Job
@@ -304,7 +304,7 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 			j.LastProgress = ev.Progress
 		}
 		if ev.Terminal != nil {
-			if ev.Terminal.Host != batch.Host || !filepath.IsAbs(ev.Terminal.Socket) || ev.Terminal.Target == "" {
+			if ev.Terminal.Host == "" || !filepath.IsAbs(ev.Terminal.Socket) || ev.Terminal.Target == "" {
 				return errors.New("invalid terminal endpoint")
 			}
 			j.Terminal = ev.Terminal

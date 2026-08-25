@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,8 +13,9 @@ import (
 )
 
 type API struct {
-	Store  *Store
-	Logger *slog.Logger
+	Store        *Store
+	Logger       *slog.Logger
+	Capabilities protocol.Capabilities
 }
 
 func (a API) Handler() http.Handler {
@@ -28,13 +30,16 @@ func (a API) Handler() http.Handler {
 		}
 		output(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
+	m.HandleFunc("GET /v1/capabilities", func(w http.ResponseWriter, _ *http.Request) {
+		output(w, http.StatusOK, a.Capabilities)
+	})
 	m.HandleFunc("POST /v1/jobs", a.create)
 	m.HandleFunc("GET /v1/jobs", a.list)
 	m.HandleFunc("GET /v1/jobs/{id}", a.get)
 	m.HandleFunc("POST /v1/jobs/{id}/cancel", a.cancel)
 	m.HandleFunc("POST /v1/jobs/{id}/reap", a.reap)
 	m.HandleFunc("POST /v1/jobs/{id}/answer", a.answer)
-	m.HandleFunc("POST /v1/hosts/{host}/poll", a.poll)
+	m.HandleFunc("POST /v1/jobs/poll", a.poll)
 	m.HandleFunc("POST /v1/events", a.events)
 	return a.logging(m)
 }
@@ -67,6 +72,27 @@ func (a API) create(w http.ResponseWriter, r *http.Request) {
 		failure(w, err, 400)
 		return
 	}
+	harness, ok := a.Capabilities.Harnesses[string(x.Harness)]
+	if !ok {
+		failure(w, fmt.Errorf("harness %q is not configured", x.Harness), http.StatusUnprocessableEntity)
+		return
+	}
+	if x.Model != "" {
+		allowed := false
+		for _, model := range harness.Models {
+			if model == x.Model {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			failure(w, fmt.Errorf("model %q is not configured for harness %q", x.Model, x.Harness), http.StatusUnprocessableEntity)
+			return
+		}
+	}
+	// Host is retained on the wire for compatibility and terminal display, but
+	// ownership is always this daemon and cannot be selected by dispatchers.
+	x.Host = a.Capabilities.Name
 	j, err := a.Store.Create(r.Context(), x)
 	if err != nil {
 		failure(w, err, 400)
@@ -131,7 +157,7 @@ func (a API) poll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	p, err := a.Store.Poll(r.Context(), r.PathValue("host"))
+	p, err := a.Store.Poll(r.Context())
 	if err != nil {
 		failure(w, err, 500)
 		return

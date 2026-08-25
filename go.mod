@@ -2,7 +2,10 @@ module github.com/gisikw/golem
 
 go 1.23
 
-require modernc.org/sqlite v1.34.5
+require (
+	github.com/pelletier/go-toml/v2 v2.2.3
+	modernc.org/sqlite v1.34.5
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
