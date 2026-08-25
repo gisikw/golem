@@ -95,6 +95,13 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
+	seenTokens := map[string]bool{}
+	for _, token := range c.APIBearerTokens {
+		if token == "" || seenTokens[token] {
+			return Config{}, errors.New("api_bearer_tokens must not contain empty or duplicate tokens")
+		}
+		seenTokens[token] = true
+	}
 	for name, p := range c.Projects {
 		if name == "" || !filepath.IsAbs(p.Path) {
 			return Config{}, fmt.Errorf("project %q path must be absolute", name)

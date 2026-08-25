@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -8,10 +9,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gisikw/golem/artifacts"
 	"github.com/gisikw/golem/protocol"
 )
 
@@ -21,6 +26,7 @@ type API struct {
 	Capabilities protocol.Capabilities
 	Workspaces   *WorkspaceResolver
 	PiProviders  map[string]bool
+	ArtifactRoot string
 }
 
 func (a API) Handler() http.Handler {
@@ -41,13 +47,15 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("POST /v1/jobs", a.create)
 	m.HandleFunc("GET /v1/jobs", a.list)
 	m.HandleFunc("GET /v1/jobs/{id}", a.get)
+	m.HandleFunc("GET /v1/jobs/{id}/artifacts", a.listArtifacts)
+	m.HandleFunc("GET /v1/jobs/{id}/artifacts/{path...}", a.getArtifact)
 	m.HandleFunc("POST /v1/jobs/{id}/cancel", a.cancel)
 	m.HandleFunc("POST /v1/jobs/{id}/reap", a.reap)
 	m.HandleFunc("POST /v1/jobs/{id}/answer", a.answer)
 	m.HandleFunc("POST /v1/jobs/poll", a.poll)
 	m.HandleFunc("POST /v1/events", a.events)
 	m.HandleFunc("GET /v1/events", a.streamEvents)
-	return a.logging(m)
+	return a.logging(artifactPathGuard(m))
 }
 func decode(w http.ResponseWriter, r *http.Request, v any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
@@ -263,6 +271,155 @@ func (a API) streamEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+var errMalformedArtifactPath = errors.New("malformed artifact path")
+
+func (a API) artifactDirectory(r *http.Request) (string, error) {
+	job, err := a.Store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		return "", err
+	}
+	if a.ArtifactRoot == "" || job.Artifacts.ID == "" || filepath.Base(job.Artifacts.ID) != job.Artifacts.ID || job.Artifacts.ID == "." || job.Artifacts.ID == ".." {
+		return "", errMalformedArtifactPath
+	}
+	realRoot, err := filepath.EvalSymlinks(a.ArtifactRoot)
+	if err != nil {
+		return "", err
+	}
+	realRoot, err = filepath.Abs(realRoot)
+	if err != nil {
+		return "", err
+	}
+	directory, err := filepath.EvalSymlinks(filepath.Join(realRoot, job.Artifacts.ID))
+	if err != nil {
+		return "", err
+	}
+	directory, err = filepath.Abs(directory)
+	if err != nil || !pathWithin(realRoot, directory) || directory == realRoot {
+		return "", errMalformedArtifactPath
+	}
+	return directory, nil
+}
+
+func (a API) listArtifacts(w http.ResponseWriter, r *http.Request) {
+	directory, err := a.artifactDirectory(r)
+	if err != nil {
+		artifactFailure(w, err)
+		return
+	}
+	info, err := os.Stat(directory)
+	if err != nil || !info.IsDir() {
+		artifactFailure(w, err)
+		return
+	}
+	output(w, http.StatusOK, artifacts.List(directory))
+}
+
+func (a API) getArtifact(w http.ResponseWriter, r *http.Request) {
+	rel := r.PathValue("path")
+	if malformedArtifactRelative(rel) {
+		failure(w, errMalformedArtifactPath, http.StatusBadRequest)
+		return
+	}
+	directory, err := a.artifactDirectory(r)
+	if err != nil {
+		artifactFailure(w, err)
+		return
+	}
+	candidate, err := filepath.EvalSymlinks(filepath.Join(directory, filepath.FromSlash(rel)))
+	if err != nil {
+		artifactFailure(w, err)
+		return
+	}
+	candidate, err = filepath.Abs(candidate)
+	if err != nil || !pathWithin(directory, candidate) || candidate == directory {
+		failure(w, errMalformedArtifactPath, http.StatusBadRequest)
+		return
+	}
+	file, err := os.Open(candidate)
+	if err != nil {
+		artifactFailure(w, err)
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		artifactFailure(w, err)
+		return
+	}
+	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
+}
+
+func malformedArtifactRelative(rel string) bool {
+	if rel == "" || filepath.IsAbs(rel) || strings.ContainsRune(rel, 0) || strings.Contains(rel, `\`) {
+		return true
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." || part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// artifactPathGuard runs before ServeMux's path-cleaning redirects so raw dot,
+// dot-dot, doubled-slash, and encoded absolute attempts receive JSON 400s
+// rather than being canonicalized into a different resource.
+func artifactPathGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		escaped := r.URL.EscapedPath()
+		if r.Method == http.MethodGet && strings.HasPrefix(escaped, "/v1/jobs/") {
+			if at := strings.Index(escaped, "/artifacts/"); at >= 0 {
+				rel, err := url.PathUnescape(escaped[at+len("/artifacts/"):])
+				if err != nil || malformedArtifactRelative(rel) {
+					failure(w, errMalformedArtifactPath, http.StatusBadRequest)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !filepath.IsAbs(rel) && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func artifactFailure(w http.ResponseWriter, err error) {
+	if errors.Is(err, errMalformedArtifactPath) {
+		failure(w, errMalformedArtifactPath, http.StatusBadRequest)
+		return
+	}
+	if err == nil || errors.Is(err, os.ErrNotExist) || errors.Is(err, sql.ErrNoRows) {
+		failure(w, errors.New("artifact not found"), http.StatusNotFound)
+		return
+	}
+	failure(w, err, http.StatusInternalServerError)
+}
+
+// BearerAuth enforces configured TCP credentials. Every configured candidate
+// is checked with crypto/subtle; a successful match does not short-circuit the
+// remaining candidates.
+func BearerAuth(tokens []string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := r.Header.Get("Authorization")
+		provided := ""
+		if strings.HasPrefix(raw, "Bearer ") {
+			provided = strings.TrimPrefix(raw, "Bearer ")
+		}
+		matched := 0
+		for _, token := range tokens {
+			matched |= subtle.ConstantTimeCompare([]byte(provided), []byte(token))
+		}
+		if provided == "" || matched != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="golemd"`)
+			failure(w, errors.New("bearer token required"), http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (a API) logging(next http.Handler) http.Handler {
