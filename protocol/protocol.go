@@ -228,10 +228,16 @@ type Usage struct {
 }
 
 type ArtifactRef struct {
-	Name   string `json:"-"` // legacy adapter label; Path is the wire identity
-	Path   string `json:"path"`
-	Size   int64  `json:"size"`
-	Digest string `json:"-"`
+	Name       string    `json:"-"` // legacy adapter label; Path is the wire identity
+	Path       string    `json:"path"`
+	Size       int64     `json:"size"`
+	ModifiedAt time.Time `json:"modified_at,omitempty"`
+	Digest     string    `json:"-"`
+}
+
+type ArtifactListing struct {
+	Artifacts          []ArtifactRef `json:"artifacts"`
+	ArtifactsTruncated bool          `json:"artifacts_truncated,omitempty"`
 }
 
 type WorktreeSettlement struct {

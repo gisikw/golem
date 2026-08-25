@@ -9,6 +9,7 @@ import (
 	"github.com/gisikw/golem/client"
 	"github.com/gisikw/golem/protocol"
 	"github.com/gisikw/golem/supervisor"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,14 +43,15 @@ func print(v any) {
 func main() {
 	root := flag.NewFlagSet("golem", flag.ExitOnError)
 	endpoint := root.String("service", env("GOLEM_ENDPOINT", defaultEndpoint()), "golemd URL or unix:///path")
+	token := root.String("token", env("GOLEM_TOKEN", ""), "bearer token for TCP endpoints")
 	root.BoolVar(&jsonOut, "json", false, "JSON output")
 	root.Parse(os.Args[1:])
 	args := root.Args()
 	if len(args) == 0 {
-		fatal(fmt.Errorf("usage: golem [--service URL] [--json] {dispatch|capabilities|status|list|await|events|attach|attach-hint|cancel|reap|answer|gc}"))
+		fatal(fmt.Errorf("usage: golem [--service URL] [--token TOKEN] [--json] {dispatch|capabilities|status|list|await|events|artifacts|attach|attach-hint|cancel|reap|answer|gc}"))
 	}
 	ctx := context.Background()
-	c := client.New(*endpoint)
+	c := client.NewWithToken(*endpoint, *token)
 	switch args[0] {
 	case "dispatch":
 		f := flag.NewFlagSet("dispatch", flag.ExitOnError)
@@ -181,6 +183,57 @@ func main() {
 					fatal(e)
 				}
 			}
+		}
+	case "artifacts":
+		artifactArgs := append([]string{}, args[1:]...)
+		outputPath := ""
+		for i := 0; i < len(artifactArgs); i++ {
+			if artifactArgs[i] == "-o" {
+				if i+1 >= len(artifactArgs) || outputPath != "" {
+					fatal(errors.New("artifacts -o requires one file"))
+				}
+				outputPath = artifactArgs[i+1]
+				artifactArgs = append(artifactArgs[:i], artifactArgs[i+2:]...)
+				i--
+			}
+		}
+		if len(artifactArgs) < 1 || len(artifactArgs) > 2 || len(artifactArgs) == 1 && outputPath != "" {
+			fatal(errors.New("usage: golem artifacts JOB-ID [PATH] [-o FILE]"))
+		}
+		if len(artifactArgs) == 1 {
+			listing, e := c.Artifacts(ctx, artifactArgs[0])
+			if e != nil {
+				fatal(e)
+			}
+			if jsonOut {
+				print(listing)
+			} else {
+				for _, artifact := range listing.Artifacts {
+					fmt.Printf("%s\t%d\t%s\n", artifact.Path, artifact.Size, artifact.ModifiedAt.Format(time.RFC3339))
+				}
+				if listing.ArtifactsTruncated {
+					fmt.Fprintln(os.Stderr, "golem: artifact listing truncated")
+				}
+			}
+			break
+		}
+		response, e := c.FetchArtifact(ctx, artifactArgs[0], artifactArgs[1])
+		if e != nil {
+			fatal(e)
+		}
+		defer response.Body.Close()
+		out := io.Writer(os.Stdout)
+		var file *os.File
+		if outputPath != "" {
+			file, e = os.Create(outputPath)
+			if e != nil {
+				fatal(e)
+			}
+			defer file.Close()
+			out = file
+		}
+		if _, e = io.Copy(out, response.Body); e != nil {
+			fatal(e)
 		}
 	case "cancel":
 		need(args, 2)

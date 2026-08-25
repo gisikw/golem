@@ -65,7 +65,7 @@ func main() {
 	state := flag.String("state", env("GOLEM_STATE", defaultState), "durable daemon state directory")
 	db := flag.String("db", env("GOLEM_DB", ""), "SQLite path (default: STATE/golem.db)")
 	socket := flag.String("unix", env("GOLEM_SOCKET", ""), "Unix socket (default: STATE/golemd.sock; empty via --listen-only)")
-	listen := flag.String("listen", env("GOLEM_LISTEN", ""), "loopback TCP address; empty disables")
+	listen := flag.String("listen", env("GOLEM_LISTEN", ""), "TCP address; empty disables")
 	listenOnly := flag.Bool("listen-only", false, "disable the default Unix listener")
 	artifactRoot := flag.String("artifact-root", env("GOLEM_ARTIFACT_ROOT", ""), "artifact root (default: STATE/artifacts)")
 	allowedRoots := flag.String("allowed-cwd-roots", env("GOLEM_ALLOWED_CWD_ROOTS", home), "allowed CWD roots separated by OS path-list separator")
@@ -89,12 +89,24 @@ func main() {
 	if *artifactRoot == "" {
 		*artifactRoot = filepath.Join(*state, "artifacts")
 	}
+	if err = validateTCPAuth(*listen, cfg.APIBearerTokens); err != nil {
+		slog.Error("config", "error", err)
+		os.Exit(2)
+	}
+	if *listen != "" && len(cfg.APIBearerTokens) == 0 {
+		slog.Warn("loopback TCP listener has no bearer tokens; use only for local development", "address", *listen)
+	}
 	if *offline < 0 || *linger < 0 || *interval <= 0 || *allowedRoots == "" {
 		slog.Error("invalid daemon configuration")
 		os.Exit(2)
 	}
 	if err = os.MkdirAll(*state, 0o700); err != nil {
 		slog.Error("state directory", "error", err)
+		os.Exit(1)
+	}
+
+	if err = os.MkdirAll(*artifactRoot, 0o700); err != nil {
+		slog.Error("artifact root", "error", err)
 		os.Exit(1)
 	}
 
@@ -125,8 +137,8 @@ func main() {
 		projects[name] = project.Path
 	}
 	workspaceResolver := &service.WorkspaceResolver{State: *state, Projects: projects, CloneEnabled: cfg.CloneEnabled}
-	api := service.API{Store: store, Capabilities: cfg.Capabilities(version), Workspaces: workspaceResolver, PiProviders: providerNames}
-	servers, listeners, err := serve(api.Handler(), *socket, *listen)
+	api := service.API{Store: store, Capabilities: cfg.Capabilities(version), Workspaces: workspaceResolver, PiProviders: providerNames, ArtifactRoot: *artifactRoot}
+	servers, listeners, err := serve(api.Handler(), *socket, *listen, cfg.APIBearerTokens)
 	if err != nil {
 		slog.Error("listen", "error", err)
 		os.Exit(1)
@@ -163,7 +175,11 @@ func main() {
 	if *socket == "" {
 		internalEndpoint = "http://" + *listen
 	}
-	sup := &supervisor.Supervisor{Host: cfg.Name, Client: client.New(internalEndpoint), Registry: registry, Tmux: tmux, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters, AttachHost: cfg.Name, AttachPort: cfg.AttachSSH.Port}
+	internalClient := client.New(internalEndpoint)
+	if *socket == "" && len(cfg.APIBearerTokens) > 0 {
+		internalClient.Token = cfg.APIBearerTokens[0]
+	}
+	sup := &supervisor.Supervisor{Host: cfg.Name, Client: internalClient, Registry: registry, Tmux: tmux, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters, AttachHost: cfg.Name, AttachPort: cfg.AttachSSH.Port}
 
 	var sshServer *attachssh.Server
 	if cfg.AttachSSH.Port != 0 {
@@ -219,7 +235,22 @@ func main() {
 	}
 }
 
-func serve(handler http.Handler, socket, address string) ([]*http.Server, []net.Listener, error) {
+func validateTCPAuth(address string, tokens []string) error {
+	if address == "" || len(tokens) > 0 {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid TCP listen address: %w", err)
+	}
+	ip := net.ParseIP(host)
+	if strings.EqualFold(host, "localhost") || ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return errors.New("TCP listen beyond loopback requires api_bearer_tokens")
+}
+
+func serve(handler http.Handler, socket, address string, tokens []string) ([]*http.Server, []net.Listener, error) {
 	var servers []*http.Server
 	var listeners []net.Listener
 	start := func(network, target string) error {
@@ -238,15 +269,6 @@ func serve(handler http.Handler, socket, address string) ([]*http.Server, []net.
 				}
 				_ = os.Remove(target)
 			}
-		} else {
-			host, _, err := net.SplitHostPort(target)
-			if err != nil {
-				return err
-			}
-			ip := net.ParseIP(host)
-			if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-				return errors.New("TCP listen must be loopback")
-			}
 		}
 		listener, err := net.Listen(network, target)
 		if err != nil {
@@ -255,7 +277,11 @@ func serve(handler http.Handler, socket, address string) ([]*http.Server, []net.
 		if network == "unix" {
 			_ = os.Chmod(target, 0o600)
 		}
-		server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+		serverHandler := handler
+		if network == "tcp" && len(tokens) > 0 {
+			serverHandler = service.BearerAuth(tokens, handler)
+		}
+		server := &http.Server{Handler: serverHandler, ReadHeaderTimeout: 5 * time.Second}
 		servers, listeners = append(servers, server), append(listeners, listener)
 		go func() {
 			slog.Info("listening", "component", "golemd", "network", network, "address", target)

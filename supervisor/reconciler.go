@@ -9,10 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
+	"github.com/gisikw/golem/artifacts"
 	"github.com/gisikw/golem/client"
 	"github.com/gisikw/golem/harnesses"
 	"github.com/gisikw/golem/harnesses/claude"
@@ -91,7 +91,7 @@ func DefaultAdapters(piBinary string, claudeArgv, codexArgv []string) map[string
 }
 
 func ConfiguredAdapters(pi piadapter.Adapter, claudeArgv, codexArgv []string) map[string]harnesses.Adapter {
-	return map[string]harnesses.Adapter{"pi": pi, "claude": claude.Adapter{ArgvTemplate: claudeArgv}, "codex": codex.Adapter{ArgvTemplate: codexArgv}, "fake": claude.Adapter{ArgvTemplate: []string{"sh", "-c", "printf '%s\\n' fake-worker-complete; sleep 1"}}}
+	return map[string]harnesses.Adapter{"pi": pi, "claude": claude.Adapter{ArgvTemplate: claudeArgv}, "codex": codex.Adapter{ArgvTemplate: codexArgv}, "fake": claude.Adapter{ArgvTemplate: []string{"sh", "-c", "printf '%s\\n' fake-worker-complete; printf '%s\\n' fake-artifact >\"$GOLEM_ARTIFACT_DIR/result.txt\"; sleep 1"}}}
 }
 
 // Recover adopts surviving sessions. Only pi (currently the only resumable
@@ -287,6 +287,10 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 	if err != nil {
 		return err
 	}
+	if launch.Env == nil {
+		launch.Env = map[string]string{}
+	}
+	launch.Env["GOLEM_ARTIFACT_DIR"] = j.Artifacts.Directory
 	session, target, err := s.Tmux.Start(ctx, j.ID, launch)
 	if err != nil {
 		return err
@@ -535,31 +539,9 @@ func (s *Supervisor) enrichSettlement(job protocol.Job, set *protocol.Settlement
 	if set.ExitStatus == nil {
 		set.ExitStatus = obs.ExitCode
 	}
-	root := job.Artifacts.Directory
-	artifacts := []protocol.ArtifactRef{}
-	if root != "" {
-		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-			if err != nil || entry.IsDir() {
-				return nil
-			}
-			if len(artifacts) >= 100 {
-				set.ArtifactsTruncated = true
-				return filepath.SkipAll
-			}
-			info, infoErr := entry.Info()
-			if infoErr != nil || !info.Mode().IsRegular() {
-				return nil
-			}
-			rel, relErr := filepath.Rel(root, path)
-			if relErr != nil {
-				return nil
-			}
-			artifacts = append(artifacts, protocol.ArtifactRef{Path: filepath.ToSlash(rel), Size: info.Size()})
-			return nil
-		})
-	}
-	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].Path < artifacts[j].Path })
-	set.Artifacts = artifacts
+	listing := artifacts.List(job.Artifacts.Directory)
+	set.Artifacts = listing.Artifacts
+	set.ArtifactsTruncated = listing.ArtifactsTruncated
 	if job.Workspace != nil {
 		wt := &protocol.WorktreeSettlement{Name: job.Workspace.Worktree}
 		if out, err := exec.Command("git", "-C", job.CWD, "rev-parse", "--short", "HEAD").Output(); err == nil {

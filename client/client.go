@@ -16,8 +16,9 @@ import (
 )
 
 type Client struct {
-	Base string
-	HTTP *http.Client
+	Base  string
+	HTTP  *http.Client
+	Token string
 }
 
 func New(endpoint string) *Client {
@@ -30,6 +31,18 @@ func New(endpoint string) *Client {
 		}}
 	}
 	return c
+}
+
+func NewWithToken(endpoint, token string) *Client {
+	c := New(endpoint)
+	c.Token = token
+	return c
+}
+
+func (c *Client) authorize(req *http.Request) {
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
 }
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
 	var r io.Reader
@@ -45,6 +58,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		return e
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authorize(req)
 	res, e := c.HTTP.Do(req)
 	if e != nil {
 		return e
@@ -102,6 +116,35 @@ func (c *Client) Capabilities(ctx context.Context) (protocol.Capabilities, error
 func (c *Client) Events(ctx context.Context, b protocol.EventBatch) error {
 	return c.do(ctx, "POST", "/v1/events", b, nil)
 }
+func (c *Client) Artifacts(ctx context.Context, id string) (protocol.ArtifactListing, error) {
+	var listing protocol.ArtifactListing
+	err := c.do(ctx, "GET", "/v1/jobs/"+url.PathEscape(id)+"/artifacts", nil, &listing)
+	return listing, err
+}
+func (c *Client) FetchArtifact(ctx context.Context, id, path string) (*http.Response, error) {
+	parts := strings.Split(path, "/")
+	for i := range parts {
+		if parts[i] == "" || parts[i] == "." || parts[i] == ".." {
+			return nil, fmt.Errorf("malformed artifact path")
+		}
+		parts[i] = url.PathEscape(parts[i])
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", c.Base+"/v1/jobs/"+url.PathEscape(id)+"/artifacts/"+strings.Join(parts, "/"), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.authorize(req)
+	res, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode/100 != 2 {
+		defer res.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		return nil, fmt.Errorf("agent service: %s: %s", res.Status, strings.TrimSpace(string(body)))
+	}
+	return res, nil
+}
 
 // StreamEvents connects to the resumable SSE feed. Each channel is closed when
 // the request ends; terminal transport/decode errors are sent on errs.
@@ -117,6 +160,7 @@ func (c *Client) StreamEvents(ctx context.Context, since int64, job string) (<-c
 			errs <- err
 			return
 		}
+		c.authorize(req)
 		hc := *c.HTTP
 		hc.Timeout = 0
 		res, err := hc.Do(req)

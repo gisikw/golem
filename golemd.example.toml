@@ -2,7 +2,10 @@
 # harness that offers them.
 name = "local"
 clone_enabled = false
-api_bearer_tokens = [] # Declared for future enforcement.
+# Required when --listen binds beyond loopback. Every TCP request (including
+# SSE) must then send Authorization: Bearer TOKEN. Unix sockets stay exempt.
+# Empty is allowed only for a loopback listener and logs a development warning.
+api_bearer_tokens = []
 
 [providers.openai]
 base_url = "https://api.openai.com/v1"
