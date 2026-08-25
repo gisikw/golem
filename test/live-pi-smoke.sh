@@ -9,7 +9,11 @@ model=${GOLEM_LIVE_MODEL:-llama/Qwen3.8-27B-UD-Q4_K_XL}
 provider=${model%%/*}
 state=$(mktemp -d)
 pid=
-cleanup() { [[ -z "$pid" ]] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }; rm -rf "$state"; }
+cleanup() {
+  [[ -z "$pid" ]] || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+  tmux -S "$state/state/tmux.sock" kill-server 2>/dev/null || true
+  rm -rf "$state"
+}
 trap cleanup EXIT
 project="$state/project"
 git init -q "$project"

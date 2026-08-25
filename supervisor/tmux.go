@@ -207,6 +207,34 @@ func (t Tmux) Kill(ctx context.Context, session string) error {
 	_, err := t.run(ctx, "kill-session", "-t", session)
 	return err
 }
+
+// KillServer tears down the complete private process boundary. All worker
+// panes belong to this server, so killing it also kills every worker process.
+// It is intentionally idempotent for shutdown paths where no worker ever
+// caused the lazy tmux server to be created.
+func (t Tmux) KillServer(ctx context.Context) error {
+	if !t.ServerAlive(ctx) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		t.removeSocket()
+		return nil
+	}
+	if _, err := t.run(ctx, "kill-server"); err != nil {
+		return err
+	}
+	// Some tmux versions leave the now-inert Unix socket node behind briefly.
+	// Remove only a socket at the private prepared path; never unlink an
+	// unexpected replacement.
+	t.removeSocket()
+	return nil
+}
+
+func (t Tmux) removeSocket() {
+	if fi, err := os.Lstat(t.Socket); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		_ = os.Remove(t.Socket)
+	}
+}
 func (t Tmux) Interrupt(ctx context.Context, target string) error {
 	_, err := t.run(ctx, "send-keys", "-t", target, "C-c")
 	return err

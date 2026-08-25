@@ -5,6 +5,7 @@ state=$(mktemp -d)
 pid=
 cleanup() {
   if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
+  tmux -S "$state/daemon/tmux.sock" kill-server 2>/dev/null || true
   rm -rf "$state"
 }
 trap cleanup EXIT
