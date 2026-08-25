@@ -218,20 +218,41 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			for _, server := range servers {
-				_ = server.Shutdown(shutdown)
-			}
-			if sshServer != nil {
-				_ = sshServer.Shutdown(shutdown)
-			}
-			cancel()
+			shutdownDaemon(servers, sshServer, tmux)
 			return
 		case <-ticker.C:
 			if err = sup.Tick(ctx); err != nil && ctx.Err() == nil {
 				slog.Warn("reconcile failed; workers preserved", "error", err)
 			}
 		}
+	}
+}
+
+// shutdownDaemon runs only after the signal context has stopped the
+// supervisor loop. First stop accepting API/attach traffic, then tear down the
+// private tmux process boundary and every worker pane it owns. Store state is
+// deliberately untouched: boot reconciliation either resumes a capable
+// adapter or records a vanished non-resumable worker as failed; shutdown never
+// fabricates successful completion.
+func shutdownDaemon(servers []*http.Server, sshServer *attachssh.Server, tmux supervisor.Tmux) {
+	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	for _, server := range servers {
+		if err := server.Shutdown(shutdown); err != nil {
+			slog.Warn("HTTP shutdown incomplete", "error", err)
+		}
+	}
+	if sshServer != nil {
+		if err := sshServer.Shutdown(shutdown); err != nil {
+			slog.Warn("SSH attach shutdown incomplete", "error", err)
+		}
+	}
+	cancel()
+
+	// Use a fresh bound so a slow HTTP drain cannot prevent worker teardown.
+	killCtx, killCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer killCancel()
+	if err := tmux.KillServer(killCtx); err != nil {
+		slog.Error("private tmux shutdown failed", "error", err)
 	}
 }
 

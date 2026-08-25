@@ -192,6 +192,50 @@ func TestFakeWorkerOutputIsVisibleCapturedAndSettled(t *testing.T) {
 	}
 }
 
+func TestBootReconciliationFailsVanishedNonResumableWorker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cwd, artifactRoot := t.TempDir(), t.TempDir()
+	s, store, c := testSupervisor(t, cwd, artifactRoot)
+	s.Tmux = Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
+	if err := s.Tmux.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	job, err := c.Create(ctx, protocol.CreateJob{IdempotencyKey: "boot-missing", Harness: "fake", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("boot-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job, err = store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch := harnesses.Launch{Argv: []string{"sh", "-c", "sleep 60"}, Dir: cwd, Transcript: filepath.Join(artifactRoot, "transcript")}
+	if err = s.Registry.Put(Worker{Job: job, Launch: launch, Session: "worker-" + job.ID, Target: "worker-" + job.ID + ":0.0", LastState: protocol.Running, RestartUntil: time.Now().Add(time.Minute), StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the next-boot path after graceful shutdown killed tmux but left
+	// durable job/worker state untouched. Fake is deliberately non-resumable.
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.Failed || got.Settlement == nil {
+		t.Fatalf("vanished worker was not failed during boot reconciliation: %#v", got)
+	}
+	if !strings.Contains(string(got.Settlement.Detail), "private tmux server unavailable") {
+		t.Fatalf("missing honest crash boundary: %s", got.Settlement.Detail)
+	}
+}
+
 func TestPermanentStartFailureSettlesImmediatelyAndRejectsCWD(t *testing.T) {
 	allowed := t.TempDir()
 	outside := t.TempDir()
