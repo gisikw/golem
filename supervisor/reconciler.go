@@ -152,6 +152,17 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 			s.resumeWorker(ctx, w, "confirmed")
 		}
 	}
+	// Reassert the terminal endpoint for any live worker whose service record
+	// lacks it. The endpoint (host + private socket + deterministic target) is
+	// durable, not a lifecycle-transition side effect: if the Starting/Running
+	// event that originally carried it was lost while the service was briefly
+	// unavailable, the row would otherwise stay activation-less forever (its
+	// tmux session is genuinely live but the viewer, correctly, cannot target
+	// it). Redelivery is idempotent (stable event id, deterministic endpoint)
+	// and stops once the record matches, so a healthy worker emits nothing.
+	for _, d := range poll.Assignments {
+		s.reassertTerminal(ctx, d.Job)
+	}
 	s.reapExpired(ctx, time.Now())
 	for _, a := range Diff(poll.Assignments, s.Registry.Snapshot()) {
 		switch a.Kind {
@@ -308,6 +319,46 @@ func (s *Supervisor) publishState(ctx context.Context, w *Worker, state protocol
 	}
 	w.LastState = state
 	return s.Registry.Put(*w)
+}
+
+// reassertTerminal idempotently ensures the service record for a live local
+// worker carries the exact tmux terminal endpoint. The endpoint is durable and
+// deterministic (host + private socket + "worker-<jobid>:0.0" target), so a
+// terminal-only event with a stable id is safe to redeliver: the store dedups
+// by event id and applies ev.Terminal independent of lifecycle state. This is
+// the recovery path for the case where the Starting/Running event that
+// originally carried the endpoint was lost (service briefly unavailable) and
+// the worker's LastState has since advanced past Starting, so the
+// Starting-retry self-heal in observe can no longer fire. Without it a
+// genuinely live agent row stays activation-less and the viewer, correctly,
+// cannot target it.
+//
+// It fabricates nothing: it acts only for a worker that is present locally,
+// unsettled, and whose tmux session is actually alive. A dead/stale/absent
+// session is skipped, so those rows stay nonactionable. It also no-ops once the
+// service record already matches, so a healthy worker emits no extra events and
+// the normal Starting-transition path stays authoritative.
+func (s *Supervisor) reassertTerminal(ctx context.Context, job protocol.Job) {
+	w, ok := s.Registry.Snapshot()[job.ID]
+	if !ok || !w.SettledAt.IsZero() || w.Target == "" {
+		return
+	}
+	// Still Starting: the observe self-heal owns delivery via the honest
+	// Starting->Running transition; do not race it with a bare terminal event.
+	if w.LastState == protocol.Starting {
+		return
+	}
+	want := protocol.TerminalEndpoint{Host: s.Host, Socket: s.Tmux.Socket, Target: w.Target}
+	if job.Terminal != nil && *job.Terminal == want {
+		return
+	}
+	if !s.Tmux.Has(ctx, w.Session) {
+		return // no live terminal exists; never fabricate a target
+	}
+	event := protocol.ObservedEvent{ID: job.ID + "-terminal", JobID: job.ID, Terminal: &want, ObservedAt: time.Now().UTC()}
+	if err := s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
+		s.log().Warn("terminal endpoint reassertion deferred", "job", job.ID, "error", err)
+	}
 }
 
 // publishBlocked reports a side-channel blocked question and moves the worker to
