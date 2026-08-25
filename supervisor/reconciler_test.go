@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gisikw/golem/client"
+	"github.com/gisikw/golem/harnesses"
+	piadapter "github.com/gisikw/golem/harnesses/pi"
 	"github.com/gisikw/golem/protocol"
 	"github.com/gisikw/golem/service"
 )
@@ -31,6 +33,57 @@ func testSupervisor(t *testing.T, cwd, artifactRoot string) (*Supervisor, *servi
 	c := client.New(httpServer.URL)
 	s := &Supervisor{Host: "host", Client: c, Registry: registry, ArtifactRoot: artifactRoot, AllowedCWDRoots: []string{cwd}, Adapters: DefaultAdapters("", nil, nil), MaxStartAttempts: 2, StartBackoff: time.Nanosecond}
 	return s, store, c
+}
+
+func TestPiSideChannelCompletionSettlesWhileTUIIsAlive(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux absent")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cwd, artifacts := t.TempDir(), t.TempDir()
+	s, store, _ := testSupervisor(t, cwd, artifacts)
+	s.Tmux = Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
+	if err := s.Tmux.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.Tmux.run(context.Background(), "kill-server") })
+	s.Adapters["pi"] = piadapter.Adapter{}
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "pi-side", Harness: "pi", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: "pi-start", JobID: job.ID, State: protocol.Starting}}}); err != nil {
+		t.Fatal(err)
+	}
+	job.Artifacts.Directory = filepath.Join(artifacts, job.Artifacts.ID)
+	if err = os.MkdirAll(job.Artifacts.Directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	events := filepath.Join(job.Artifacts.Directory, "events.jsonl")
+	launch := harnesses.Launch{Argv: []string{"sh", "-c", "sleep 30"}, Dir: cwd, Events: events, Interactive: true}
+	session, target, err := s.Tmux.Start(ctx, job.ID, launch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := Worker{Job: job, Launch: launch, Session: session, Target: target, LastState: protocol.Starting, StartedAt: time.Now()}
+	if err = s.Registry.Put(worker); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(events, []byte(`{"type":"settled","ts":1,"verdict":"done","summary":"finished","usage":{"input":3,"output":2,"cost":0}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.observe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, job.ID)
+	if err != nil || got.State != protocol.Done || got.Settlement == nil || got.Settlement.Summary != "finished" {
+		t.Fatalf("pi completion did not propagate: %#v %v", got, err)
+	}
+	alive, _, err := s.Tmux.Pane(ctx, target)
+	if err != nil || !alive {
+		t.Fatalf("interactive pane should still be alive at side-channel settlement: %v %v", alive, err)
+	}
 }
 
 func TestFakeWorkerOutputIsVisibleCapturedAndSettled(t *testing.T) {
@@ -68,6 +121,9 @@ func TestFakeWorkerOutputIsVisibleCapturedAndSettled(t *testing.T) {
 	got, err := store.Get(ctx, job.ID)
 	if err != nil || got.State != protocol.Done || got.Settlement == nil {
 		t.Fatalf("fake worker did not settle from captured transcript: %#v %v", got, err)
+	}
+	if got.Settlement.ExitStatus == nil || *got.Settlement.ExitStatus != 0 || len(got.Settlement.Artifacts) == 0 {
+		t.Fatalf("fake settlement lacks exit status/artifact listing: %#v", got.Settlement)
 	}
 	pane, err := s.Tmux.run(ctx, "capture-pane", "-p", "-S", "-", "-t", worker.Target)
 	if err != nil || !strings.Contains(pane, "fake-worker-complete") {

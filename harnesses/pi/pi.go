@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gisikw/golem/harnesses"
+	piintegration "github.com/gisikw/golem/integrations/pi"
 	"github.com/gisikw/golem/protocol"
 )
 
@@ -35,9 +36,10 @@ import (
 // so the operator's personal profile can never leak in through ambient env.
 type Adapter struct {
 	Binary string
-	// HookExtension is the agent-hooks side-channel extension path. When empty
-	// no lifecycle is reported over the side channel and the worker settles only
-	// on process death (supervisor crash boundary).
+	// HookExtension optionally overrides the built-in agent-hooks side-channel
+	// extension. When empty, the embedded signed-off extension is materialized
+	// into the worker's private profile; lifecycle observation is never silently
+	// disabled.
 	HookExtension string
 	// WebExtension is the optional self-contained web (search + fetch) extension.
 	// It carries no operator-specific state; its SSRF guard defaults to
@@ -172,11 +174,19 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 		}
 		configured = true
 	}
+	extensions := a.workerExtensions()
+	if a.HookExtension == "" {
+		builtIn, err := piintegration.WriteHooks(dir)
+		if err != nil {
+			return err
+		}
+		extensions = append([]string{builtIn}, extensions...)
+	}
 	settings := map[string]any{
 		"lastChangelogVersion": "0.84.1",
 		// Omit the compaction key entirely: pi's native default (enabled) applies.
 		// Workers have no custom handoff machinery; pi compacts natively.
-		"extensions": a.workerExtensions(),
+		"extensions": extensions,
 	}
 	if provider != "" {
 		settings["defaultProvider"] = provider

@@ -8,7 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gisikw/golem/protocol"
 )
@@ -44,6 +46,7 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("POST /v1/jobs/{id}/answer", a.answer)
 	m.HandleFunc("POST /v1/jobs/poll", a.poll)
 	m.HandleFunc("POST /v1/events", a.events)
+	m.HandleFunc("GET /v1/events", a.streamEvents)
 	return a.logging(m)
 }
 func decode(w http.ResponseWriter, r *http.Request, v any) error {
@@ -202,6 +205,53 @@ func (a API) events(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+func (a API) streamEvents(w http.ResponseWriter, r *http.Request) {
+	since := int64(0)
+	if raw := r.URL.Query().Get("since"); raw != "" {
+		var err error
+		since, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || since < 0 {
+			failure(w, errors.New("since must be a non-negative integer"), 400)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		failure(w, errors.New("streaming unsupported"), 500)
+		return
+	}
+	wake, unsubscribe := a.Store.Subscribe()
+	defer unsubscribe()
+	jobID := r.URL.Query().Get("job")
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+	for {
+		events, err := a.Store.Events(r.Context(), since, jobID)
+		if err != nil {
+			return
+		}
+		for _, event := range events {
+			body, _ := json.Marshal(event)
+			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", event.Seq, event.Kind, body)
+			since = event.Seq
+		}
+		if len(events) > 0 {
+			flusher.Flush()
+			continue
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-wake:
+		case <-keepalive.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
 func (a API) logging(next http.Handler) http.Handler {
 	log := a.Logger
 	if log == nil {

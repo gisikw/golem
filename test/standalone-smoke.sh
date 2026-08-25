@@ -55,8 +55,20 @@ echo '--- await ---'
 "$state/golem" --service "$endpoint" await --timeout 15s "$id"
 echo '--- list ---'
 "$state/golem" --service "$endpoint" list
-state_value=$("$state/golem" --service "$endpoint" --json status "$id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
+status=$("$state/golem" --service "$endpoint" --json status "$id")
+state_value=$(sed -n 's/.*"state":"\([^"]*\)".*/\1/p' <<<"$status")
 [[ "$state_value" == done ]]
+grep -q '"settlement"' <<<"$status"
+grep -q '"exit_status":0' <<<"$status"
+set +e
+timeout 2 "$state/golem" --service "$endpoint" events --since 0 --job "$id" >"$state/events.jsonl"
+events_rc=$?
+set -e
+[[ "$events_rc" == 124 ]]
+grep -q '"kind":"job.created"' "$state/events.jsonl"
+grep -q '"kind":"job.state"' "$state/events.jsonl"
+grep -q '"kind":"job.settled"' "$state/events.jsonl"
+echo 'settlement + lifecycle replay: PASS'
 workspace="$project/.golem/worktrees/resume-key"
 printf 'continued\n' >"$workspace/resume-proof"
 second=$("$state/golem" --service "$endpoint" --json dispatch --harness fake --project scratch --worktree resume-key 'standalone smoke reuse')

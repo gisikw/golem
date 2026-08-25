@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/gisikw/golem/protocol"
@@ -19,7 +20,9 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db       *sql.DB
+	mu       sync.Mutex
+	watchers map[chan struct{}]struct{}
 }
 
 func Open(path string) (*Store, error) {
@@ -34,7 +37,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, watchers: make(map[chan struct{}]struct{})}
 	_, err = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, idem TEXT UNIQUE NOT NULL, host TEXT NOT NULL,
@@ -42,8 +45,11 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
 CREATE TABLE IF NOT EXISTS events (
- id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), body BLOB NOT NULL, created TEXT NOT NULL
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id TEXT UNIQUE NOT NULL,
+ job_id TEXT NOT NULL REFERENCES jobs(id), kind TEXT NOT NULL, body BLOB NOT NULL, created TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS events_job_seq ON events(job_id,seq);
+CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS settlements (
  id TEXT PRIMARY KEY, job_id TEXT UNIQUE NOT NULL REFERENCES jobs(id), body BLOB NOT NULL, created TEXT NOT NULL
 );
@@ -79,8 +85,21 @@ func (s *Store) Create(ctx context.Context, c protocol.CreateJob) (protocol.Job,
 	artifacts := protocol.ArtifactMetadata{ID: id, RetentionDays: c.Artifacts.RetentionDays, Labels: c.Artifacts.Labels}
 	j := protocol.Job{ID: id, IdempotencyKey: c.IdempotencyKey, Harness: c.Harness, Model: c.Model, CWD: c.CWD, Workspace: c.ResolvedWorkspace, Prompt: c.Prompt, Artifacts: artifacts, Host: c.Host, State: protocol.Assigned, CreatedAt: now, UpdatedAt: now}
 	body, _ := json.Marshal(j)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO jobs(id,idem,host,state,body,created,updated) VALUES(?,?,?,?,?,?,?)`, j.ID, j.IdempotencyKey, j.Host, j.State, body, stamp(now), stamp(now))
+	tx, txErr := s.db.BeginTx(ctx, nil)
+	if txErr != nil {
+		return protocol.Job{}, txErr
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO jobs(id,idem,host,state,body,created,updated) VALUES(?,?,?,?,?,?,?)`, j.ID, j.IdempotencyKey, j.Host, j.State, body, stamp(now), stamp(now))
 	if err == nil {
+		err = insertEvent(ctx, tx, j.ID+"-created", protocol.Event{Kind: "job.created", JobID: j.ID, State: j.State, At: now})
+	}
+	if err == nil {
+		err = tx.Commit()
+	} else {
+		_ = tx.Rollback()
+	}
+	if err == nil {
+		s.signal()
 		return j, nil
 	}
 	old, getErr := s.getByIdem(ctx, c.IdempotencyKey)
@@ -246,11 +265,12 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 		if ev.ID == "" || ev.JobID == "" {
 			return errors.New("event id and job id are required")
 		}
-		var exists int
-		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM events WHERE id=?", ev.ID).Scan(&exists); err != nil {
-			return err
+		res, deliveryErr := tx.ExecContext(ctx, "INSERT OR IGNORE INTO deliveries(id) VALUES(?)", ev.ID)
+		if deliveryErr != nil {
+			return deliveryErr
 		}
-		if exists != 0 {
+		inserted, _ := res.RowsAffected()
+		if inserted == 0 {
 			continue
 		}
 		var raw []byte
@@ -261,9 +281,17 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 		if err = json.Unmarshal(raw, &j); err != nil {
 			return err
 		}
+		priorState := j.State
 		next := ev.State
+		settlementInserted := false
 		if ev.Settlement != nil {
-			if ev.Settlement.ID == "" || ev.Settlement.JobID != j.ID || !ev.Settlement.Verdict.Terminal() {
+			if ev.Settlement.State == "" {
+				ev.Settlement.State = ev.Settlement.Verdict
+			}
+			if ev.Settlement.Verdict == "" {
+				ev.Settlement.Verdict = ev.Settlement.State
+			}
+			if ev.Settlement.ID == "" || ev.Settlement.JobID != j.ID || !ev.Settlement.State.Terminal() {
 				return errors.New("invalid settlement")
 			}
 			var prior []byte
@@ -271,10 +299,10 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 			if err == nil {
 				var old protocol.Settlement
 				_ = json.Unmarshal(prior, &old)
-				if old.ID != ev.Settlement.ID || old.JobID != ev.Settlement.JobID || old.Verdict != ev.Settlement.Verdict {
-					return errors.New("conflicting settlement")
+				if old.State == "" {
+					old.State = old.Verdict
 				}
-				next, j.Settlement = old.Verdict, &old // first durable settlement wins
+				next, j.Settlement = old.State, &old // first durable settlement wins
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return err
 			} else {
@@ -282,8 +310,12 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 				if _, err = tx.ExecContext(ctx, `INSERT INTO settlements(id,job_id,body,created) VALUES(?,?,?,?)`, ev.Settlement.ID, j.ID, settleBody, stamp(ev.Settlement.At)); err != nil {
 					return err
 				}
-				next, j.Settlement = ev.Settlement.Verdict, ev.Settlement
+				next, j.Settlement = ev.Settlement.State, ev.Settlement
+				settlementInserted = true
 			}
+		}
+		if ev.Settlement != nil && !settlementInserted && ev.State == "" && ev.Progress == nil && ev.Question == nil && ev.Terminal == nil {
+			continue // first settlement is immutable; later attempts are true no-ops
 		}
 		if next != "" {
 			if err = protocol.ValidateTransition(j.State, next, ev.Settlement != nil || j.Settlement != nil); err != nil {
@@ -313,12 +345,85 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 		if _, err = tx.ExecContext(ctx, "UPDATE jobs SET state=?,body=?,updated=? WHERE id=?", j.State, raw, stamp(j.UpdatedAt), j.ID); err != nil {
 			return err
 		}
-		eventBody, _ := json.Marshal(ev)
-		if _, err = tx.ExecContext(ctx, `INSERT INTO events(id,job_id,body,created) VALUES(?,?,?,?)`, ev.ID, j.ID, eventBody, stamp(j.UpdatedAt)); err != nil {
-			return err
+		public := []protocol.Event{}
+		if ev.Progress != nil {
+			public = append(public, protocol.Event{Kind: "job.progress", JobID: j.ID, Progress: ev.Progress, At: j.UpdatedAt})
+		}
+		if j.State != priorState {
+			public = append(public, protocol.Event{Kind: "job.state", JobID: j.ID, State: j.State, At: j.UpdatedAt, Question: func() *protocol.BlockedQuestion {
+				if j.State == protocol.Blocked {
+					return j.Question
+				}
+				return nil
+			}()})
+		}
+		if settlementInserted {
+			public = append(public, protocol.Event{Kind: "job.settled", JobID: j.ID, Settlement: j.Settlement, At: j.UpdatedAt})
+		}
+		for n, event := range public {
+			if err = insertEvent(ctx, tx, fmt.Sprintf("%s/%d", ev.ID, n), event); err != nil {
+				return err
+			}
 		}
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err == nil {
+		s.signal()
+	}
+	return err
+}
+
+// Events replays durable public events strictly after since.
+func (s *Store) Events(ctx context.Context, since int64, jobID string) ([]protocol.Event, error) {
+	query := "SELECT seq,body FROM events WHERE seq>?"
+	args := []any{since}
+	if jobID != "" {
+		query += " AND job_id=?"
+		args = append(args, jobID)
+	}
+	query += " ORDER BY seq"
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []protocol.Event{}
+	for rows.Next() {
+		var seq int64
+		var body []byte
+		var event protocol.Event
+		if err = rows.Scan(&seq, &body); err == nil {
+			err = json.Unmarshal(body, &event)
+		}
+		if err != nil {
+			return nil, err
+		}
+		event.Seq = seq
+		out = append(out, event)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) Subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	s.mu.Lock()
+	s.watchers[ch] = struct{}{}
+	s.mu.Unlock()
+	return ch, func() { s.mu.Lock(); delete(s.watchers, ch); s.mu.Unlock() }
+}
+func (s *Store) signal() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for ch := range s.watchers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+func insertEvent(ctx context.Context, tx *sql.Tx, deliveryID string, event protocol.Event) error {
+	body, _ := json.Marshal(event)
+	_, err := tx.ExecContext(ctx, `INSERT INTO events(delivery_id,job_id,kind,body,created) VALUES(?,?,?,?,?)`, deliveryID, event.JobID, event.Kind, body, stamp(event.At))
+	return err
 }
 
 func (s *Store) update(ctx context.Context, id string, f func(*protocol.Job) error) (protocol.Job, error) {
@@ -338,13 +443,30 @@ func (s *Store) updateTx(ctx context.Context, id string, f func(*sql.Tx, *protoc
 	if err = json.Unmarshal(body, &j); err != nil {
 		return j, err
 	}
+	priorState := j.State
 	if err = f(tx, &j); err != nil {
 		return j, err
 	}
 	j.UpdatedAt = time.Now().UTC()
+	if j.State != priorState {
+		eventID, idErr := newID("event")
+		if idErr != nil {
+			return j, idErr
+		}
+		e := protocol.Event{Kind: "job.state", JobID: j.ID, State: j.State, At: j.UpdatedAt}
+		if j.State == protocol.Blocked {
+			e.Question = j.Question
+		}
+		if err = insertEvent(ctx, tx, eventID, e); err != nil {
+			return j, err
+		}
+	}
 	body, _ = json.Marshal(j)
 	if _, err = tx.ExecContext(ctx, "UPDATE jobs SET state=?,body=?,updated=? WHERE id=?", j.State, body, stamp(j.UpdatedAt), id); err == nil {
 		err = tx.Commit()
+	}
+	if err == nil && j.State != priorState {
+		s.signal()
 	}
 	return j, err
 }

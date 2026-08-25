@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -100,4 +101,56 @@ func (c *Client) Capabilities(ctx context.Context) (protocol.Capabilities, error
 }
 func (c *Client) Events(ctx context.Context, b protocol.EventBatch) error {
 	return c.do(ctx, "POST", "/v1/events", b, nil)
+}
+
+// StreamEvents connects to the resumable SSE feed. Each channel is closed when
+// the request ends; terminal transport/decode errors are sent on errs.
+func (c *Client) StreamEvents(ctx context.Context, since int64, job string) (<-chan protocol.Event, <-chan error) {
+	out := make(chan protocol.Event)
+	errs := make(chan error, 1)
+	go func() {
+		defer close(out)
+		defer close(errs)
+		path := fmt.Sprintf("/v1/events?since=%d&job=%s", since, url.QueryEscape(job))
+		req, err := http.NewRequestWithContext(ctx, "GET", c.Base+path, nil)
+		if err != nil {
+			errs <- err
+			return
+		}
+		hc := *c.HTTP
+		hc.Timeout = 0
+		res, err := hc.Do(req)
+		if err != nil {
+			errs <- err
+			return
+		}
+		defer res.Body.Close()
+		if res.StatusCode/100 != 2 {
+			b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+			errs <- fmt.Errorf("agent service: %s: %s", res.Status, strings.TrimSpace(string(b)))
+			return
+		}
+		scan := bufio.NewScanner(res.Body)
+		scan.Buffer(make([]byte, 64<<10), 4<<20)
+		for scan.Scan() {
+			line := scan.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var event protocol.Event
+			if err = json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+				errs <- err
+				return
+			}
+			select {
+			case out <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if err = scan.Err(); err != nil && ctx.Err() == nil {
+			errs <- err
+		}
+	}()
+	return out, errs
 }
