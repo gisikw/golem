@@ -8,6 +8,10 @@ The local service sends `PollResponse.assignments` downward to its in-process su
 
 Observed-event IDs, create keys, answer keys, and settlement IDs are stable idempotency keys. An observation and its resulting job mutation commit in one SQLite transaction. Public lifecycle events receive a separate SQLite-assigned global sequence and are available as replay-then-tail SSE from `GET /v1/events?since=SEQ`; kinds are `job.created`, `job.state`, `job.progress`, and `job.settled`.
 
+## Interaction
+
+`POST /v1/jobs/{id}/answer` answers the explicit question on a blocked job. `POST /v1/jobs/{id}/steer` accepts `{"text":"..."}` only while a job is `starting` or `running`; blocked jobs must use `answer`, and all other lifecycle states return conflict. Steering input is persisted and queued in request order. The supervisor delivers answers and steers during reconciliation through the same tmux bracketed-paste-plus-Enter callback. Accepting a steer emits a durable `job.progress` event noting that it is queued for delivery.
+
 Lifecycle: `pending → assigned → starting → running ↔ blocked → cancelling`, ending in `done`, `failed`, `cancelled`, or `timeout`. Terminal transitions require a structured settlement in the same durable transaction. It records state, bounded harness verdict, optional exit status and usage, a capped relative artifact listing, and resolved-worktree status. The first settlement wins; repeated observations and later settlement attempts are harmless no-ops.
 
 `artifacts.id` is a logical service-assigned identifier, not a path. `GET /v1/jobs/{id}/artifacts` returns `{artifacts:[{path,size,modified_at}],artifacts_truncated}` for running or settled jobs; `GET /v1/jobs/{id}/artifacts/{path...}` serves bytes with standard range support. Listings and settlement use the same 100-regular-file enumerator. Normal dispatch supplies `workspace`: either `{project,worktree}` or `{repo,ref,worktree}`. golemd resolves and stores the persistent named worktree and its path before assignment. Direct `cwd` remains a low-level escape hatch and all resolved paths are checked against local allowed roots before launch.

@@ -177,22 +177,47 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 			s.forget(ctx, a.JobID)
 		}
 	}
-	// Deliver answered blocked questions after assignment reconciliation.
+	// Deliver queued interaction input after assignment reconciliation. Answers
+	// retain adapter semantics; steers use the same runtime SendText callback, so
+	// both paths converge on one tmux bracketed-paste-plus-Enter implementation.
 	for _, d := range poll.Assignments {
 		w, ok := s.Registry.Snapshot()[d.Job.ID]
-		if !ok || d.Job.Question == nil || d.Job.Question.Answer == nil || w.AnsweredKey == d.Job.Question.Answer.IdempotencyKey {
+		if !ok {
 			continue
 		}
-		adapter, e := s.adapter(w.Job.Harness)
-		if e != nil {
+		answerPending := d.Job.Question != nil && d.Job.Question.Answer != nil && w.AnsweredKey != d.Job.Question.Answer.IdempotencyKey
+		if answerPending {
+			adapter, e := s.adapter(w.Job.Harness)
+			if e == nil {
+				runtime := s.runtime(w)
+				if e = adapter.Answer(ctx, &runtime, *d.Job.Question.Answer); e == nil {
+					w.AnsweredKey = d.Job.Question.Answer.IdempotencyKey
+					answerPending = false
+					_ = s.Registry.Put(w)
+				} else if !errors.Is(e, harnesses.ErrUnsupported) {
+					s.log().Warn("answer delivery failed", "job", w.Job.ID, "error", e)
+				}
+			}
+		}
+		if answerPending {
 			continue
 		}
-		runtime := s.runtime(w)
-		if e = adapter.Answer(ctx, &runtime, *d.Job.Question.Answer); e == nil {
-			w.AnsweredKey = d.Job.Question.Answer.IdempotencyKey
+		start := 0
+		if w.SteeredKey != "" {
+			for i := range d.Job.Steers {
+				if d.Job.Steers[i].ID == w.SteeredKey {
+					start = i + 1
+					break
+				}
+			}
+		}
+		for _, steer := range d.Job.Steers[start:] {
+			if e := s.sendText(ctx, w, steer.Text); e != nil {
+				s.log().Warn("steer delivery failed", "job", w.Job.ID, "steer", steer.ID, "error", e)
+				break
+			}
+			w.SteeredKey = steer.ID
 			_ = s.Registry.Put(w)
-		} else if !errors.Is(e, harnesses.ErrUnsupported) {
-			s.log().Warn("answer delivery failed", "job", w.Job.ID, "error", e)
 		}
 	}
 	return s.observe(ctx)
@@ -387,8 +412,12 @@ func (s *Supervisor) publishBlocked(ctx context.Context, w *Worker, q *protocol.
 	w.LastState = protocol.Blocked
 	return s.Registry.Put(*w)
 }
+func (s *Supervisor) sendText(ctx context.Context, w Worker, text string) error {
+	return s.Tmux.Send(ctx, w.Target, text)
+}
+
 func (s *Supervisor) runtime(w Worker) harnesses.Runtime {
-	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.Tmux.Send(ctx, w.Target, text) }, Cancel: func(ctx context.Context) error { return s.Tmux.Kill(ctx, w.Session) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Tmux.Pane(ctx, w.Target) }}
+	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }, Cancel: func(ctx context.Context) error { return s.Tmux.Kill(ctx, w.Session) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Tmux.Pane(ctx, w.Target) }}
 }
 func (s *Supervisor) reapExpired(ctx context.Context, now time.Time) {
 	linger := s.Linger

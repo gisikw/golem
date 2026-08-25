@@ -55,7 +55,11 @@ CREATE TABLE IF NOT EXISTS settlements (
 );
 CREATE TABLE IF NOT EXISTS answers (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), body BLOB NOT NULL, created TEXT NOT NULL
-);`)
+);
+CREATE TABLE IF NOT EXISTS steers (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(id), body BLOB NOT NULL, created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS steers_job_seq ON steers(job_id,seq);`)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -228,6 +232,40 @@ func (s *Store) Answer(ctx context.Context, id string, a protocol.Answer) (proto
 		}
 		return nil
 	})
+}
+
+var ErrSteerConflict = errors.New("job cannot receive steering input")
+
+func (s *Store) Steer(ctx context.Context, id string, steer protocol.Steer) (protocol.Job, error) {
+	if steer.Text == "" {
+		return protocol.Job{}, errors.New("text is required")
+	}
+	steerID, err := newID("steer")
+	if err != nil {
+		return protocol.Job{}, err
+	}
+	steer.ID = steerID
+	steer.At = time.Now().UTC()
+	j, err := s.updateTx(ctx, id, func(tx *sql.Tx, j *protocol.Job) error {
+		if j.State != protocol.Starting && j.State != protocol.Running {
+			if j.State == protocol.Blocked {
+				return fmt.Errorf("%w: blocked jobs must use answer", ErrSteerConflict)
+			}
+			return fmt.Errorf("%w in state %s", ErrSteerConflict, j.State)
+		}
+		body, _ := json.Marshal(steer)
+		if _, insertErr := tx.ExecContext(ctx, `INSERT INTO steers(id,job_id,body,created) VALUES(?,?,?,?)`, steer.ID, id, body, stamp(steer.At)); insertErr != nil {
+			return insertErr
+		}
+		j.Steers = append(j.Steers, steer)
+		detail, _ := json.Marshal(map[string]string{"interaction": "steer", "status": "queued", "steer_id": steer.ID})
+		progress := &protocol.Progress{ID: steer.ID + "-progress", JobID: id, At: steer.At, Message: "steering input queued for delivery", Detail: detail}
+		return insertEvent(ctx, tx, steer.ID+"-progress", protocol.Event{Kind: "job.progress", JobID: id, Progress: progress, At: steer.At})
+	})
+	if err == nil {
+		s.signal()
+	}
+	return j, err
 }
 
 func (s *Store) Poll(ctx context.Context) (protocol.PollResponse, error) {

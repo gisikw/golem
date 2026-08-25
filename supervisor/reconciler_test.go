@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -33,6 +34,62 @@ func testSupervisor(t *testing.T, cwd, artifactRoot string) (*Supervisor, *servi
 	c := client.New(httpServer.URL)
 	s := &Supervisor{Host: "host", Client: c, Registry: registry, ArtifactRoot: artifactRoot, AllowedCWDRoots: []string{cwd}, Adapters: DefaultAdapters("", nil, nil), MaxStartAttempts: 2, StartBackoff: time.Nanosecond}
 	return s, store, c
+}
+
+func TestTickDeliversPersistedSteersInOrder(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux absent")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cwd, artifacts := t.TempDir(), t.TempDir()
+	s, store, _ := testSupervisor(t, cwd, artifacts)
+	s.Tmux = Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
+	if err := s.Tmux.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.Tmux.run(context.Background(), "kill-server") })
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "steer-order", Harness: "fake", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("steer-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job, _ = store.Get(ctx, job.ID)
+	launch := harnesses.Launch{Argv: []string{"bash", "--noprofile", "--norc"}, Dir: cwd, Interactive: true}
+	session, target, err := s.Tmux.Start(ctx, job.ID, launch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Registry.Put(Worker{Job: job, Launch: launch, Session: session, Target: target, LastState: protocol.Running, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(cwd, "steered")
+	if _, err = store.Steer(ctx, job.ID, protocol.Steer{Text: "printf first >>" + out}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Steer(ctx, job.ID, protocol.Steer{Text: "printf second >>" + out}); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if got, readErr := os.ReadFile(out); readErr == nil && string(got) == "firstsecond" {
+			worker := s.Registry.Snapshot()[job.ID]
+			persisted, _ := store.Get(ctx, job.ID)
+			if worker.SteeredKey != persisted.Steers[1].ID {
+				t.Fatalf("delivery cursor not persisted: %#v", worker)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got, _ := os.ReadFile(out)
+	t.Fatalf("steers not delivered in order: %q", got)
 }
 
 func TestPiSideChannelCompletionSettlesWhileTUIIsAlive(t *testing.T) {

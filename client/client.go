@@ -103,6 +103,11 @@ func (c *Client) Answer(ctx context.Context, id string, a protocol.Answer) (prot
 	e := c.do(ctx, "POST", "/v1/jobs/"+url.PathEscape(id)+"/answer", a, &j)
 	return j, e
 }
+func (c *Client) Steer(ctx context.Context, id string, steer protocol.Steer) (protocol.Job, error) {
+	var j protocol.Job
+	e := c.do(ctx, "POST", "/v1/jobs/"+url.PathEscape(id)+"/steer", steer, &j)
+	return j, e
+}
 func (c *Client) Poll(ctx context.Context, k map[string]protocol.State) (protocol.PollResponse, error) {
 	var x protocol.PollResponse
 	e := c.do(ctx, "POST", "/v1/jobs/poll", protocol.PollRequest{Known: k}, &x)

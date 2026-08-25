@@ -52,6 +52,7 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("POST /v1/jobs/{id}/cancel", a.cancel)
 	m.HandleFunc("POST /v1/jobs/{id}/reap", a.reap)
 	m.HandleFunc("POST /v1/jobs/{id}/answer", a.answer)
+	m.HandleFunc("POST /v1/jobs/{id}/steer", a.steer)
 	m.HandleFunc("POST /v1/jobs/poll", a.poll)
 	m.HandleFunc("POST /v1/events", a.events)
 	m.HandleFunc("GET /v1/events", a.streamEvents)
@@ -198,6 +199,28 @@ func (a API) answer(w http.ResponseWriter, r *http.Request) {
 	}
 	a.publicJob(&j)
 	output(w, 200, j)
+}
+func (a API) steer(w http.ResponseWriter, r *http.Request) {
+	var x struct {
+		Text string `json:"text"`
+	}
+	if err := decode(w, r, &x); err != nil {
+		failure(w, err, http.StatusBadRequest)
+		return
+	}
+	j, err := a.Store.Steer(r.Context(), r.PathValue("id"), protocol.Steer{Text: x.Text})
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, ErrSteerConflict) {
+			status = http.StatusConflict
+		}
+		failure(w, err, status)
+		return
+	}
+	a.publicJob(&j)
+	output(w, http.StatusOK, j)
 }
 func (a API) poll(w http.ResponseWriter, r *http.Request) {
 	var x protocol.PollRequest
