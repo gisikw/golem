@@ -69,15 +69,6 @@ func (s *Store) Create(ctx context.Context, c protocol.CreateJob) (protocol.Job,
 	if c.Host == "" {
 		c.Host = "local"
 	}
-	if c.Isolation == "" {
-		c.Isolation = protocol.IsolationNone
-	}
-	if c.Isolation != protocol.IsolationNone && c.Isolation != protocol.IsolationWorktree {
-		return protocol.Job{}, errors.New("invalid isolation policy")
-	}
-	if err := protocol.ValidateProviderConfig(c.ProviderConfig); err != nil {
-		return protocol.Job{}, err
-	}
 	now := time.Now().UTC()
 	id, err := newID("job")
 	if err != nil {
@@ -86,7 +77,7 @@ func (s *Store) Create(ctx context.Context, c protocol.CreateJob) (protocol.Job,
 	// Artifact identity is global semantic metadata; host-local paths are
 	// deliberately resolved by the assigned supervisor.
 	artifacts := protocol.ArtifactMetadata{ID: id, RetentionDays: c.Artifacts.RetentionDays, Labels: c.Artifacts.Labels}
-	j := protocol.Job{ID: id, IdempotencyKey: c.IdempotencyKey, Harness: c.Harness, Model: c.Model, ProviderConfig: c.ProviderConfig, CWD: c.CWD, Isolation: c.Isolation, Prompt: c.Prompt, Artifacts: artifacts, Host: c.Host, State: protocol.Assigned, CreatedAt: now, UpdatedAt: now}
+	j := protocol.Job{ID: id, IdempotencyKey: c.IdempotencyKey, Harness: c.Harness, Model: c.Model, CWD: c.CWD, Workspace: c.ResolvedWorkspace, Prompt: c.Prompt, Artifacts: artifacts, Host: c.Host, State: protocol.Assigned, CreatedAt: now, UpdatedAt: now}
 	body, _ := json.Marshal(j)
 	_, err = s.db.ExecContext(ctx, `INSERT INTO jobs(id,idem,host,state,body,created,updated) VALUES(?,?,?,?,?,?,?)`, j.ID, j.IdempotencyKey, j.Host, j.State, body, stamp(now), stamp(now))
 	if err == nil {
@@ -97,7 +88,7 @@ func (s *Store) Create(ctx context.Context, c protocol.CreateJob) (protocol.Job,
 		return protocol.Job{}, err
 	}
 	artifactMismatch := c.Artifacts.RetentionDays != old.Artifacts.RetentionDays || !reflect.DeepEqual(c.Artifacts.Labels, old.Artifacts.Labels)
-	if old.Harness != c.Harness || old.Model != c.Model || old.CWD != c.CWD || old.Isolation != c.Isolation || old.Prompt != c.Prompt || old.Host != c.Host || artifactMismatch || !reflect.DeepEqual(old.ProviderConfig, c.ProviderConfig) {
+	if old.Harness != c.Harness || old.Model != c.Model || old.CWD != c.CWD || old.Prompt != c.Prompt || old.Host != c.Host || artifactMismatch || !reflect.DeepEqual(old.Workspace, c.ResolvedWorkspace) {
 		return protocol.Job{}, errors.New("idempotency key already used for a different request")
 	}
 	return old, nil

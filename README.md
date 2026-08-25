@@ -7,7 +7,7 @@ Golem is a standalone delegated-worker system. One `golemd` daemon per host owns
 - Durable, idempotent jobs, events, answers, and settlements
 - Interactive, writable tmux sessions with direct attach hints
 - Lifecycle states from `assigned` through running, blocked, and terminal outcomes
-- Optional detached Git worktrees and host-local artifact retention
+- Persistent named Git workspaces and host-local artifact retention
 - Pi, minimal Claude/Codex, and dependency-free fake harness adapters
 - Operator-advertised harness/model and project capabilities
 - Unix-socket or loopback HTTP JSON API
@@ -52,17 +52,18 @@ With no `--service`, the CLI uses `unix://~/.local/state/golem/golemd.sock`, mat
 - `name`: this daemon's identity
 - `[harnesses.<name>] models = [...]`: verbatim model IDs scoped to that harness
 - `[projects.<name>]`: an absolute existing `path` and optional `description`
+- `[providers.<name>]`: pi `base_url` and optional `api_key_env`
 - `clone_enabled` (defaults false)
 - `api_bearer_tokens` and `[attach_ssh] port` placeholders for later phases
 
-Project paths are validated at startup. Dispatch is rejected immediately if its harness is not configured or its non-empty model is not listed for that harness. A model-less dispatch remains legal. Phase 1 still accepts direct absolute `--cwd`; project selection and clone behavior come later.
+Project paths and pi provider/model references are validated at startup. Dispatch selects either `--project NAME` or `--repo URL` plus `--worktree NAME`; the resulting `.golem/worktrees/NAME` is reused as the resume key. Repository cloning requires `clone_enabled`. Direct absolute `--cwd` remains a low-level test/fake-harness escape hatch.
 
-Existing process/provider environment settings remain available, including `GOLEM_PI`, `GOLEM_HOOK_EXTENSION`, `GOLEM_WEB_EXTENSION`, `GOLEM_PI_SOURCE_PROFILE`, `GOLEM_PI_DEFAULT_PROVIDER`, `GOLEM_PI_DEFAULT_MODEL`, `GOLEM_COPY_AUTH`, `GOLEM_CLAUDE_ARGV`, and `GOLEM_CODEX_ARGV`. Provider descriptors and credential-reference forwarding remain in the dispatch protocol until Phase 2.
+Provider descriptors and credentials are not accepted over the wire. For pi, `<provider>/<model>` resolves against operator config and `api_key_env` is read from golemd's own environment only while its private per-job profile is written.
 
 ## CLI commands
 
 - `capabilities`
-- `dispatch` (`--worktree` requests detached-worktree isolation)
+- `dispatch` (`--project` or `--repo`, plus a named `--worktree`; low-level `--cwd`)
 - `status`, `list [--state]`, and `await`
 - `attach-hint`, `answer`, `cancel`, and `reap`
 - `gc --root DIR --older-than DURATION`

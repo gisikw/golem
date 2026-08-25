@@ -2,10 +2,8 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"github.com/gisikw/golem/protocol"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -18,37 +16,6 @@ func create(t *testing.T, s *Store) protocol.Job {
 	}
 	return j
 }
-func TestCreateRejectsPlaintextProviderSecret(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	secret := "fixture-api-key"
-	_, err = s.Create(context.Background(), protocol.CreateJob{
-		IdempotencyKey: "secret-key", Harness: "fake", Host: "host", Prompt: "go", CWD: "/tmp",
-		ProviderConfig: &protocol.ProviderConfig{Provider: "demo", ModelsJSON: json.RawMessage(`{"providers":{"demo":{"apiKey":"` + secret + `"}}}`)},
-	})
-	if err == nil || strings.Contains(err.Error(), secret) {
-		t.Fatalf("plaintext provider secret was accepted or echoed: %v", err)
-	}
-}
-
-func TestCreateAcceptsProviderSecretReference(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	_, err = s.Create(context.Background(), protocol.CreateJob{
-		IdempotencyKey: "reference-key", Harness: "fake", Host: "host", Prompt: "go", CWD: "/tmp",
-		ProviderConfig: &protocol.ProviderConfig{Provider: "demo", ModelsJSON: json.RawMessage(`{"providers":{"demo":{"apiKey":"$GOLEM_API_KEY"}}}`)},
-	})
-	if err != nil {
-		t.Fatalf("reference rejected: %v", err)
-	}
-}
-
 func TestSettlementIdempotentAndDurable(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "db")
 	s, e := Open(p)

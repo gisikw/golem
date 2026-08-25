@@ -116,7 +116,13 @@ func main() {
 	}
 	defer store.Close()
 
-	piAdapter := piadapter.Adapter{Binary: *piBinary, HookExtension: os.Getenv("GOLEM_HOOK_EXTENSION"), WebExtension: os.Getenv("GOLEM_WEB_EXTENSION"), SourceProfile: env("GOLEM_PI_SOURCE_PROFILE", os.Getenv("PI_CODING_AGENT_DIR")), CopyAuth: os.Getenv("GOLEM_COPY_AUTH") == "1", DefaultProvider: os.Getenv("GOLEM_PI_DEFAULT_PROVIDER"), DefaultModel: os.Getenv("GOLEM_PI_DEFAULT_MODEL")}
+	piProviders := make(map[string]piadapter.Provider, len(cfg.Providers))
+	providerNames := make(map[string]bool, len(cfg.Providers))
+	for name, provider := range cfg.Providers {
+		piProviders[name] = piadapter.Provider{BaseURL: provider.BaseURL, APIKeyEnv: provider.APIKeyEnv}
+		providerNames[name] = true
+	}
+	piAdapter := piadapter.Adapter{Binary: *piBinary, HookExtension: os.Getenv("GOLEM_HOOK_EXTENSION"), WebExtension: os.Getenv("GOLEM_WEB_EXTENSION"), SourceProfile: env("GOLEM_PI_SOURCE_PROFILE", os.Getenv("PI_CODING_AGENT_DIR")), CopyAuth: os.Getenv("GOLEM_COPY_AUTH") == "1", DefaultProvider: os.Getenv("GOLEM_PI_DEFAULT_PROVIDER"), DefaultModel: os.Getenv("GOLEM_PI_DEFAULT_MODEL"), Providers: piProviders}
 	adapters := supervisor.ConfiguredAdapters(piAdapter, argvEnv("GOLEM_CLAUDE_ARGV", []string{"claude", "{prompt}"}), argvEnv("GOLEM_CODEX_ARGV", []string{"codex", "{prompt}"}))
 	for harness := range cfg.Harnesses {
 		if _, ok := adapters[harness]; !ok {
@@ -125,7 +131,12 @@ func main() {
 		}
 	}
 
-	api := service.API{Store: store, Capabilities: cfg.Capabilities(version)}
+	projects := make(map[string]string, len(cfg.Projects))
+	for name, project := range cfg.Projects {
+		projects[name] = project.Path
+	}
+	workspaceResolver := &service.WorkspaceResolver{State: *state, Projects: projects, CloneEnabled: cfg.CloneEnabled}
+	api := service.API{Store: store, Capabilities: cfg.Capabilities(version), Workspaces: workspaceResolver, PiProviders: providerNames}
 	servers, listeners, err := serve(api.Handler(), *socket, *listen)
 	if err != nil {
 		slog.Error("listen", "error", err)
@@ -158,6 +169,7 @@ func main() {
 	for _, project := range cfg.Projects {
 		roots = append(roots, project.Path)
 	}
+	roots = append(roots, filepath.Join(*state, "clones"))
 	internalEndpoint := "unix://" + *socket
 	if *socket == "" {
 		internalEndpoint = "http://" + *listen

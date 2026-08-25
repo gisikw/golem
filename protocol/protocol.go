@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -82,7 +81,6 @@ func ValidateTransition(from, to State, hasSettlement bool) error {
 }
 
 type HarnessKind string
-type IsolationPolicy string
 
 type HarnessCapability struct {
 	Models []string `json:"models"`
@@ -103,12 +101,10 @@ type Capabilities struct {
 }
 
 const (
-	HarnessPi         HarnessKind     = "pi"
-	HarnessClaude     HarnessKind     = "claude"
-	HarnessCodex      HarnessKind     = "codex"
-	HarnessFake       HarnessKind     = "fake"
-	IsolationNone     IsolationPolicy = "none"
-	IsolationWorktree IsolationPolicy = "worktree"
+	HarnessPi     HarnessKind = "pi"
+	HarnessClaude HarnessKind = "claude"
+	HarnessCodex  HarnessKind = "codex"
+	HarnessFake   HarnessKind = "fake"
 )
 
 type ArtifactRequest struct {
@@ -133,156 +129,55 @@ type TerminalEndpoint struct {
 	Target string `json:"target"`
 }
 
-// ProviderConfig is the opaque, single-provider connection descriptor the
-// dispatching client resolves at dispatch time so the worker's pi
-// boots with EXACTLY the dispatched model+provider available and selected —
-// nothing else. It is written by the adapter into the worker's isolated per-job
-// pi dir (models.json + settings defaults), never logged or emitted in
-// events/settlements.
-//
-// SECURITY: this rides the job payload, which transits the service DB. The
-// extension forwards ApiKey ONLY as an unresolved reference (pi's config-value
-// form: "!cmd" runs a host-local command, "$ENV"/"${ENV}" interpolate env), so
-// the DB stores a reference string resolved on the worker host at runtime, not a
-// plaintext secret. Built-in/login providers carry no key here at all: they set
-// Builtin+CopyAuth and the adapter copies auth.json into the private per-job dir
-// (0700/0600). See DECISIONS.md #20 for the credential-exposure note and
-// the remote-host caveat.
-// ValidateProviderConfig enforces the secret-reference contract before a
-// provider descriptor can cross the service persistence boundary. ModelsJSON
-// is intentionally limited to one provider entry, matching the worker's
-// single-provider provisioning behavior.
-func ValidateProviderConfig(pc *ProviderConfig) error {
-	if pc == nil || len(pc.ModelsJSON) == 0 {
-		return nil
-	}
-	var document map[string]json.RawMessage
-	if err := json.Unmarshal(pc.ModelsJSON, &document); err != nil || document == nil {
-		return errors.New("provider config models_json must be a JSON object")
-	}
-	rawProviders, ok := document["providers"]
-	if !ok {
-		return errors.New("provider config models_json must contain providers")
-	}
-	var providers map[string]json.RawMessage
-	if err := json.Unmarshal(rawProviders, &providers); err != nil || len(providers) != 1 {
-		return errors.New("provider config models_json must contain exactly one provider")
-	}
-	raw, ok := providers[pc.Provider]
-	if !ok {
-		return errors.New("provider config provider does not match models_json")
-	}
-	var entry map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &entry); err != nil || entry == nil {
-		return errors.New("provider config provider entry must be a JSON object")
-	}
-	var all any
-	if err := json.Unmarshal(pc.ModelsJSON, &all); err != nil {
-		return errors.New("provider config models_json contains invalid JSON")
-	}
-	if err := validateSecretReferences(all); err != nil {
-		return err
-	}
-	return nil
+// WorkspaceSelector identifies a provisioned project or managed clone.
+// Worktree is the durable resume key within that workspace.
+type WorkspaceSelector struct {
+	Project  string `json:"project,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	Ref      string `json:"ref,omitempty"`
+	Worktree string `json:"worktree"`
 }
 
-func validateSecretReferences(v any) error {
-	switch x := v.(type) {
-	case map[string]any:
-		for key, child := range x {
-			normalized := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(key, "_", ""), "-", ""))
-			if normalized == "apikey" || normalized == "credential" || normalized == "credentials" {
-				value, ok := child.(string)
-				if !ok || !isSecretReference(value) {
-					return errors.New("provider config secret fields must be unresolved references")
-				}
-				continue
-			}
-			if err := validateSecretReferences(child); err != nil {
-				return err
-			}
-		}
-	case []any:
-		for _, child := range x {
-			if err := validateSecretReferences(child); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func isSecretReference(value string) bool {
-	if strings.HasPrefix(value, "!") {
-		return len(strings.TrimSpace(value[1:])) > 0
-	}
-	if strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") {
-		return validEnvName(value[2 : len(value)-1])
-	}
-	return strings.HasPrefix(value, "$") && validEnvName(value[1:])
-}
-
-func validEnvName(value string) bool {
-	if value == "" || (value[0] != '_' && (value[0] < 'A' || value[0] > 'Z') && (value[0] < 'a' || value[0] > 'z')) {
-		return false
-	}
-	for _, r := range value[1:] {
-		if r != '_' && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
-			return false
-		}
-	}
-	return true
-}
-
-type ProviderConfig struct {
-	// Provider and Model are the canonical ids used for defaults and for scoping
-	// the worker to a single model (enabledModels "provider/model").
-	Provider string `json:"provider"`
-	Model    string `json:"model"`
-	// Builtin marks a provider pi knows natively (credentials in auth.json). No
-	// models.json is written; the adapter relies on the copied auth.json instead.
-	Builtin bool `json:"builtin,omitempty"`
-	// CopyAuth requests the adapter copy the source profile's auth.json into the
-	// worker dir (needed for oauth/stored-credential built-in providers).
-	CopyAuth bool `json:"copy_auth,omitempty"`
-	// ModelsJSON is the complete single-provider pi models.json object written
-	// verbatim (keyed by provider id, carrying baseUrl/apiKey-ref/api/models).
-	// Empty for Builtin providers.
-	ModelsJSON json.RawMessage `json:"models_json,omitempty"`
+// ResolvedWorkspace records the accepted selector and its daemon-resolved path.
+type ResolvedWorkspace struct {
+	Project  string `json:"project,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	Ref      string `json:"ref,omitempty"`
+	Worktree string `json:"worktree"`
+	Path     string `json:"path"`
 }
 
 type Job struct {
-	ID              string            `json:"id"`
-	IdempotencyKey  string            `json:"idempotency_key"`
-	Harness         HarnessKind       `json:"harness"`
-	Model           string            `json:"model,omitempty"`
-	ProviderConfig  *ProviderConfig   `json:"provider_config,omitempty"`
-	CWD             string            `json:"cwd"`
-	Isolation       IsolationPolicy   `json:"isolation"`
-	Prompt          string            `json:"prompt"`
-	Artifacts       ArtifactMetadata  `json:"artifacts"`
-	Host            string            `json:"host"`
-	State           State             `json:"state"`
-	CancelRequested bool              `json:"cancel_requested,omitempty"`
-	ReapRequested   bool              `json:"reap_requested,omitempty"`
-	Question        *BlockedQuestion  `json:"question,omitempty"`
-	LastProgress    *Progress         `json:"last_progress,omitempty"`
-	Settlement      *Settlement       `json:"settlement,omitempty"`
-	Terminal        *TerminalEndpoint `json:"terminal,omitempty"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
+	ID              string             `json:"id"`
+	IdempotencyKey  string             `json:"idempotency_key"`
+	Harness         HarnessKind        `json:"harness"`
+	Model           string             `json:"model,omitempty"`
+	CWD             string             `json:"cwd"`
+	Workspace       *ResolvedWorkspace `json:"workspace,omitempty"`
+	Prompt          string             `json:"prompt"`
+	Artifacts       ArtifactMetadata   `json:"artifacts"`
+	Host            string             `json:"host"`
+	State           State              `json:"state"`
+	CancelRequested bool               `json:"cancel_requested,omitempty"`
+	ReapRequested   bool               `json:"reap_requested,omitempty"`
+	Question        *BlockedQuestion   `json:"question,omitempty"`
+	LastProgress    *Progress          `json:"last_progress,omitempty"`
+	Settlement      *Settlement        `json:"settlement,omitempty"`
+	Terminal        *TerminalEndpoint  `json:"terminal,omitempty"`
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
 type CreateJob struct {
-	IdempotencyKey string          `json:"idempotency_key"`
-	Harness        HarnessKind     `json:"harness"`
-	Model          string          `json:"model,omitempty"`
-	ProviderConfig *ProviderConfig `json:"provider_config,omitempty"`
-	CWD            string          `json:"cwd"`
-	Isolation      IsolationPolicy `json:"isolation,omitempty"`
-	Prompt         string          `json:"prompt"`
-	Artifacts      ArtifactRequest `json:"artifacts,omitempty"`
-	Host           string          `json:"host"`
+	IdempotencyKey    string             `json:"idempotency_key"`
+	Harness           HarnessKind        `json:"harness"`
+	Model             string             `json:"model,omitempty"`
+	CWD               string             `json:"cwd,omitempty"`
+	Workspace         *WorkspaceSelector `json:"workspace,omitempty"`
+	ResolvedWorkspace *ResolvedWorkspace `json:"-"`
+	Prompt            string             `json:"prompt"`
+	Artifacts         ArtifactRequest    `json:"artifacts,omitempty"`
+	Host              string             `json:"host,omitempty"`
 }
 
 type Assignment struct {

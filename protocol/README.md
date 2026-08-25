@@ -10,6 +10,8 @@ Event IDs, create keys, answer keys, and settlement IDs are stable idempotency k
 
 Lifecycle: `pending → assigned → starting → running ↔ blocked → cancelling`, ending in `done`, `failed`, `cancelled`, or `timeout`. Terminal transitions require a settlement in the same durable transaction. Repeated nonterminal observations and duplicate deliveries are harmless.
 
-`artifacts.id` is a logical service-assigned identifier, not a path. The supervisor resolves it beneath the daemon's local artifact root. Direct `cwd` remains request data and is checked against local allowed roots before launch.
+`artifacts.id` is a logical service-assigned identifier, not a path. Normal dispatch supplies `workspace`: either `{project,worktree}` or `{repo,ref,worktree}`. golemd resolves and stores the persistent named worktree and its path before assignment. Direct `cwd` remains a low-level escape hatch and all resolved paths are checked against local allowed roots before launch.
+
+Dispatch contains only harness and model identity. Provider connection descriptors and credential references are not protocol fields; golemd provisions pi from operator config and its own environment.
 
 `GET /v1/capabilities` reports the daemon identity, version, configured harness/model offerings, path-free project catalog, clone flag, and future attach port. Dispatches cannot expand that operator-owned catalog.

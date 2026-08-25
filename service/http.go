@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/gisikw/golem/protocol"
 )
@@ -16,6 +17,8 @@ type API struct {
 	Store        *Store
 	Logger       *slog.Logger
 	Capabilities protocol.Capabilities
+	Workspaces   *WorkspaceResolver
+	PiProviders  map[string]bool
 }
 
 func (a API) Handler() http.Handler {
@@ -89,6 +92,29 @@ func (a API) create(w http.ResponseWriter, r *http.Request) {
 			failure(w, fmt.Errorf("model %q is not configured for harness %q", x.Model, x.Harness), http.StatusUnprocessableEntity)
 			return
 		}
+	}
+	if x.Harness == protocol.HarnessPi && x.Model != "" {
+		provider, _, ok := strings.Cut(x.Model, "/")
+		if !ok || !a.PiProviders[provider] {
+			failure(w, fmt.Errorf("pi model %q has no configured provider", x.Model), http.StatusUnprocessableEntity)
+			return
+		}
+	}
+	if x.Workspace != nil {
+		if x.CWD != "" {
+			failure(w, errors.New("dispatch must not specify both workspace and cwd"), http.StatusUnprocessableEntity)
+			return
+		}
+		if a.Workspaces == nil {
+			failure(w, errors.New("workspace resolution is unavailable"), http.StatusUnprocessableEntity)
+			return
+		}
+		resolved, err := a.Workspaces.Resolve(r.Context(), *x.Workspace)
+		if err != nil {
+			failure(w, err, http.StatusUnprocessableEntity)
+			return
+		}
+		x.CWD, x.ResolvedWorkspace = resolved.Path, resolved
 	}
 	// Host is retained on the wire for compatibility and terminal display, but
 	// ownership is always this daemon and cannot be selected by dispatchers.

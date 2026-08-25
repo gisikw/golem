@@ -53,34 +53,34 @@ func main() {
 		f := flag.NewFlagSet("dispatch", flag.ExitOnError)
 		h := f.String("harness", "pi", "configured harness")
 		model := f.String("model", "", "model")
-		cwd := f.String("cwd", ".", "working directory")
+		cwd := f.String("cwd", "", "low-level absolute working directory escape hatch")
+		project := f.String("project", "", "configured project name")
+		repo := f.String("repo", "", "repository URL to clone")
+		ref := f.String("ref", "", "repository ref")
+		worktree := f.String("worktree", "", "durable workspace resume key")
 		key := f.String("key", fmt.Sprintf("cli-%d", time.Now().UnixNano()), "idempotency key")
-		worktree := f.Bool("worktree", false, "use detached git worktree")
-		// provider-config is an opaque single-provider connection descriptor the
-		// dispatching client resolves at dispatch time so the worker
-		// boots with exactly the dispatched provider+model. See protocol.ProviderConfig.
-		providerConfig := f.String("provider-config", "", "JSON protocol.ProviderConfig (worker single-provider descriptor)")
 		f.Parse(args[1:])
 		if f.NArg() == 0 {
 			fatal(fmt.Errorf("dispatch requires a prompt"))
 		}
-		abs, e := filepath.Abs(*cwd)
-		if e != nil {
-			fatal(e)
-		}
-		iso := protocol.IsolationNone
-		if *worktree {
-			iso = protocol.IsolationWorktree
-		}
-		var pc *protocol.ProviderConfig
-		if *providerConfig != "" {
-			pc = &protocol.ProviderConfig{}
-			if err := json.Unmarshal([]byte(*providerConfig), pc); err != nil || protocol.ValidateProviderConfig(pc) != nil {
-				// Do not echo the supplied JSON: it may contain a credential.
-				fatal(errors.New("invalid --provider-config"))
+		var workspace *protocol.WorkspaceSelector
+		resolvedCWD := ""
+		if *project != "" || *repo != "" || *worktree != "" || *ref != "" {
+			workspace = &protocol.WorkspaceSelector{Project: *project, Repo: *repo, Ref: *ref, Worktree: *worktree}
+			if *cwd != "" {
+				fatal(errors.New("--cwd cannot be combined with workspace flags"))
+			}
+		} else {
+			if *cwd == "" {
+				*cwd = "."
+			}
+			var e error
+			resolvedCWD, e = filepath.Abs(*cwd)
+			if e != nil {
+				fatal(e)
 			}
 		}
-		j, e := c.Create(ctx, protocol.CreateJob{IdempotencyKey: *key, Harness: protocol.HarnessKind(*h), Model: *model, ProviderConfig: pc, CWD: abs, Isolation: iso, Prompt: strings.Join(f.Args(), " ")})
+		j, e := c.Create(ctx, protocol.CreateJob{IdempotencyKey: *key, Harness: protocol.HarnessKind(*h), Model: *model, CWD: resolvedCWD, Workspace: workspace, Prompt: strings.Join(f.Args(), " ")})
 		if e != nil {
 			fatal(e)
 		}

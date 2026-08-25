@@ -17,8 +17,8 @@ func TestCapabilitiesAndDispatchValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	caps := protocol.Capabilities{Name: "local-daemon", Version: "test", Harnesses: map[string]protocol.HarnessCapability{"pi": {Models: []string{"openai/gpt-5.6"}}, "fake": {Models: []string{}}}}
-	server := httptest.NewServer(API{Store: store, Capabilities: caps}.Handler())
+	caps := protocol.Capabilities{Name: "local-daemon", Version: "test", Harnesses: map[string]protocol.HarnessCapability{"pi": {Models: []string{"openai/gpt-5.6", "missing/model"}}, "fake": {Models: []string{}}}}
+	server := httptest.NewServer(API{Store: store, Capabilities: caps, PiProviders: map[string]bool{"openai": true}}.Handler())
 	defer server.Close()
 	res, err := http.Get(server.URL + "/v1/capabilities")
 	if err != nil {
@@ -45,8 +45,11 @@ func TestCapabilitiesAndDispatchValidation(t *testing.T) {
 	if status := post("claude", ""); status < 400 || status >= 500 {
 		t.Fatalf("unknown harness status %d", status)
 	}
-	if status := post("pi", "other/model"); status < 400 || status >= 500 {
+	if status := post("pi", "other/model"); status != http.StatusUnprocessableEntity {
 		t.Fatalf("unknown model status %d", status)
+	}
+	if status := post("pi", "missing/model"); status != http.StatusUnprocessableEntity {
+		t.Fatalf("missing provider status %d", status)
 	}
 	if status := post("fake", ""); status != http.StatusCreated {
 		t.Fatalf("model-less fake status %d", status)
