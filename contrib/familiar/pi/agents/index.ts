@@ -14,7 +14,6 @@ import {
 // same GOLEM_ENDPOINT consumed by the CLI and this extension.
 const CLI = parseGolemCliArgv();
 const ENDPOINT = process.env.GOLEM_ENDPOINT || "http://127.0.0.1:7337";
-const DEFAULT_HOST = process.env.GOLEM_HOST;
 const MAX_OUTPUT = 2 * 1024 * 1024;
 
 type ToolResult = {
@@ -105,17 +104,14 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Dispatch async work to an independently supervised agent worker",
     parameters: Type.Object({
       prompt: Type.String({ description: "Complete task description; the worker starts cold" }),
-      host: Type.Optional(Type.String({ description: "Worker host (defaults to GOLEM_HOST)" })),
       harness: Type.Optional(Type.String({ description: "Harness: pi, claude, codex, or fake (default pi)" })),
       model: Type.Optional(Type.String({ description: "Harness model override" })),
       cwd: Type.Optional(Type.String({ description: "Worker directory (default current directory)" })),
       worktree: Type.Optional(Type.Boolean({ description: "Request detached git-worktree isolation" })),
       key: Type.Optional(Type.String({ description: "Creation idempotency key" })),
     }),
-    async execute(_id, p: { prompt: string; host?: string; harness?: string; model?: string; cwd?: string; worktree?: boolean; key?: string }, signal, _onUpdate, ctx: ExtensionContext) {
-      const host = p.host || DEFAULT_HOST;
-      if (!host) return invoke(["dispatch", "--host", "", p.prompt], signal);
-      const args = ["dispatch", "--host", host];
+    async execute(_id, p: { prompt: string; harness?: string; model?: string; cwd?: string; worktree?: boolean; key?: string }, signal, _onUpdate, ctx: ExtensionContext) {
+      const args = ["dispatch"];
       if (p.harness) args.push("--harness", p.harness);
       if (p.model) args.push("--model", p.model);
       if (p.cwd) args.push("--cwd", p.cwd);

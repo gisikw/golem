@@ -88,9 +88,14 @@ func (c *Client) Answer(ctx context.Context, id string, a protocol.Answer) (prot
 	e := c.do(ctx, "POST", "/v1/jobs/"+url.PathEscape(id)+"/answer", a, &j)
 	return j, e
 }
-func (c *Client) Poll(ctx context.Context, h string, k map[string]protocol.State) (protocol.PollResponse, error) {
+func (c *Client) Poll(ctx context.Context, k map[string]protocol.State) (protocol.PollResponse, error) {
 	var x protocol.PollResponse
-	e := c.do(ctx, "POST", "/v1/hosts/"+url.PathEscape(h)+"/poll", protocol.PollRequest{Known: k}, &x)
+	e := c.do(ctx, "POST", "/v1/jobs/poll", protocol.PollRequest{Known: k}, &x)
+	return x, e
+}
+func (c *Client) Capabilities(ctx context.Context) (protocol.Capabilities, error) {
+	var x protocol.Capabilities
+	e := c.do(ctx, "GET", "/v1/capabilities", nil, &x)
 	return x, e
 }
 func (c *Client) Events(ctx context.Context, b protocol.EventBatch) error {

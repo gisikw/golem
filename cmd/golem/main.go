@@ -30,26 +30,28 @@ func print(v any) {
 		for _, j := range x {
 			print(j)
 		}
+	case protocol.Capabilities:
+		b, _ := json.MarshalIndent(x, "", "  ")
+		fmt.Println(string(b))
 	default:
 		fmt.Println(v)
 	}
 }
 func main() {
 	root := flag.NewFlagSet("golem", flag.ExitOnError)
-	endpoint := root.String("service", env("GOLEM_ENDPOINT", "http://127.0.0.1:7337"), "service URL or unix:///path")
+	endpoint := root.String("service", env("GOLEM_ENDPOINT", defaultEndpoint()), "golemd URL or unix:///path")
 	root.BoolVar(&jsonOut, "json", false, "JSON output")
 	root.Parse(os.Args[1:])
 	args := root.Args()
 	if len(args) == 0 {
-		fatal(fmt.Errorf("usage: golem [--service URL] [--json] {dispatch|status|list|await|attach-hint|cancel|reap|answer|gc}"))
+		fatal(fmt.Errorf("usage: golem [--service URL] [--json] {dispatch|capabilities|status|list|await|attach-hint|cancel|reap|answer|gc}"))
 	}
 	ctx := context.Background()
 	c := client.New(*endpoint)
 	switch args[0] {
 	case "dispatch":
 		f := flag.NewFlagSet("dispatch", flag.ExitOnError)
-		host := f.String("host", "", "worker host")
-		h := f.String("harness", "pi", "pi|claude|codex|fake")
+		h := f.String("harness", "pi", "configured harness")
 		model := f.String("model", "", "model")
 		cwd := f.String("cwd", ".", "working directory")
 		key := f.String("key", fmt.Sprintf("cli-%d", time.Now().UnixNano()), "idempotency key")
@@ -59,8 +61,8 @@ func main() {
 		// boots with exactly the dispatched provider+model. See protocol.ProviderConfig.
 		providerConfig := f.String("provider-config", "", "JSON protocol.ProviderConfig (worker single-provider descriptor)")
 		f.Parse(args[1:])
-		if *host == "" || f.NArg() == 0 {
-			fatal(fmt.Errorf("dispatch requires --host and prompt"))
+		if f.NArg() == 0 {
+			fatal(fmt.Errorf("dispatch requires a prompt"))
 		}
 		abs, e := filepath.Abs(*cwd)
 		if e != nil {
@@ -78,11 +80,17 @@ func main() {
 				fatal(errors.New("invalid --provider-config"))
 			}
 		}
-		j, e := c.Create(ctx, protocol.CreateJob{IdempotencyKey: *key, Harness: protocol.HarnessKind(*h), Model: *model, ProviderConfig: pc, CWD: abs, Isolation: iso, Prompt: strings.Join(f.Args(), " "), Host: *host})
+		j, e := c.Create(ctx, protocol.CreateJob{IdempotencyKey: *key, Harness: protocol.HarnessKind(*h), Model: *model, ProviderConfig: pc, CWD: abs, Isolation: iso, Prompt: strings.Join(f.Args(), " ")})
 		if e != nil {
 			fatal(e)
 		}
 		print(j)
+	case "capabilities":
+		caps, e := c.Capabilities(ctx)
+		if e != nil {
+			fatal(e)
+		}
+		print(caps)
 	case "status":
 		need(args, 2)
 		j, e := c.Get(ctx, args[1])
@@ -190,4 +198,11 @@ func env(k, d string) string {
 		return v
 	}
 	return d
+}
+func defaultEndpoint() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "unix://golemd.sock"
+	}
+	return "unix://" + filepath.Join(home, ".local", "state", "golem", "golemd.sock")
 }

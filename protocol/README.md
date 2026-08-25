@@ -1,32 +1,15 @@
-# Agent protocol
+# Golem protocol
 
-`protocol.go` is the canonical, versioned JSON contract for service, supervisor,
-harness, and client. Go types intentionally serve as the schema: every field has
-an explicit JSON name and harness-specific data is confined to opaque `detail`
-JSON. Consumers must ignore unknown detail fields.
+`protocol.go` is the canonical JSON contract shared by golemd's service, supervisor, harness adapters, and clients. Go types serve as the schema; harness-specific evidence is confined to opaque `detail` JSON.
 
 ## Reconciliation
 
-The service sends `PollResponse.assignments` (desired semantic state) downward.
-A host sends idempotent `ObservedEvent` batches upward. Event IDs, create keys,
-answer keys, and settlement IDs are stable idempotency keys. An event and its
-resulting job mutation are committed in one SQLite transaction.
+The local service sends `PollResponse.assignments` downward to its in-process supervisor. The supervisor sends idempotent `ObservedEvent` batches upward through the retained HTTP seam. There is no host claim or host-filtered assignment: every accepted job belongs to this golemd. Legacy `host` fields remain as daemon identity/display metadata to avoid a destructive schema migration.
 
-Lifecycle: `pending → assigned → starting → running ↔ blocked → cancelling`,
-ending in `done`, `failed`, `cancelled`, or `timeout`. Failure settlements may
-terminate any nonterminal state. A terminal transition is invalid without a
-settlement committed in the same durable transaction. Repeated nonterminal
-observations and exact duplicate event deliveries are harmless.
+Event IDs, create keys, answer keys, and settlement IDs are stable idempotency keys. An event and its resulting job mutation commit in one SQLite transaction.
 
-The global registry owns semantic state. `artifacts.id` is a logical,
-service-assigned job artifact identifier—not a path. Each supervisor resolves it
-beneath its configured host-local artifact root; artifact directories never
-cross the wire, and caller-supplied directory fields are rejected. Requested
-`cwd` remains semantic assignment data but is authorized against host-local
-allowed roots before launch.
+Lifecycle: `pending → assigned → starting → running ↔ blocked → cancelling`, ending in `done`, `failed`, `cancelled`, or `timeout`. Terminal transitions require a settlement in the same durable transaction. Repeated nonterminal observations and duplicate deliveries are harmless.
 
-A supervisor may report process facts, but cannot overwrite immutable job
-identity/request fields or another host's assignment. Harness detail is
-evidence, not a second common state vocabulary. Pre-worker start attempts and
-observation cursors are host-local recovery state and are intentionally absent
-from this global protocol.
+`artifacts.id` is a logical service-assigned identifier, not a path. The supervisor resolves it beneath the daemon's local artifact root. Direct `cwd` remains request data and is checked against local allowed roots before launch.
+
+`GET /v1/capabilities` reports the daemon identity, version, configured harness/model offerings, path-free project catalog, clone flag, and future attach port. Dispatches cannot expand that operator-owned catalog.

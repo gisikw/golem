@@ -135,7 +135,7 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 	for id, w := range s.Registry.Snapshot() {
 		known[id] = w.LastState
 	}
-	poll, err := s.Client.Poll(ctx, s.Host, known)
+	poll, err := s.Client.Poll(ctx, known)
 	if err != nil {
 		return err
 	} // existing workers are untouched

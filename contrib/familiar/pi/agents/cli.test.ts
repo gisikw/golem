@@ -23,11 +23,10 @@ describe("host-owned Golem CLI argv", () => {
   test("preserves whitespace-safe argv and maps tool arguments explicitly", () => {
     const argv = ["nix", "run", "/enrolled source#golem", "--"];
     expect(appendGolemToolArgs(argv, "http://127.0.0.1:7337", [
-      "dispatch", "--host", "host with spaces", "prompt with spaces",
+      "dispatch", "prompt with spaces",
     ])).toEqual([
       "nix", "run", "/enrolled source#golem", "--", "--service",
-      "http://127.0.0.1:7337", "--json", "dispatch", "--host",
-      "host with spaces", "prompt with spaces",
+      "http://127.0.0.1:7337", "--json", "dispatch", "prompt with spaces",
     ]);
   });
 });

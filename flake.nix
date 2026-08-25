@@ -13,16 +13,15 @@
           version = "0.1.0";
           src = ./.;
           inherit subPackages;
-          vendorHash = "sha256-dsmRXd5moOA08U2Hbi9Z3Hy1inZFiDOD9AMS56uk+8g=";
+          vendorHash = "sha256-WyJ94S6e0tnItNeFeaplPWGso0ZNixE6F5pr3fxBz7s=";
           doCheck = true;
           nativeBuildInputs = [ pkgs.makeWrapper ];
           meta = with pkgs.lib; { license = licenses.mit; platforms = platforms.unix; };
         };
         cli = build "golem" [ "./cmd/golem" ];
-        service = build "golem-service" [ "./cmd/golem-service" ];
-        supervisor = (build "golem-supervisor" [ "./cmd/golem-supervisor" ]).overrideAttrs (old: {
+        daemon = (build "golemd" [ "./cmd/golemd" ]).overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
-            wrapProgram $out/bin/golem-supervisor --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.bash ]}
+            wrapProgram $out/bin/golemd --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.bash ]}
           '';
         });
         familiar-render = (build "golem-familiar-render" [ "./cmd/golem-familiar-render" ]).overrideAttrs (old: {
@@ -31,16 +30,15 @@
           '';
         });
       in {
-        packages = { inherit cli service supervisor familiar-render; default = cli; };
+        packages = { inherit cli daemon familiar-render; default = cli; };
         apps = {
           default = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
           golem = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
-          golem-service = { type = "app"; program = "${service}/bin/golem-service"; };
-          golem-supervisor = { type = "app"; program = "${supervisor}/bin/golem-supervisor"; };
+          golemd = { type = "app"; program = "${daemon}/bin/golemd"; };
           golem-familiar-render = { type = "app"; program = "${familiar-render}/bin/golem-familiar-render"; };
         };
         checks = {
-          inherit cli service supervisor familiar-render;
+          inherit cli daemon familiar-render;
           agent-hooks = pkgs.runCommand "golem-agent-hooks-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
             cp -r ${./integrations/pi/agent-hooks} ./agent-hooks
             chmod -R u+w ./agent-hooks
@@ -48,9 +46,11 @@
             touch $out
           '';
           familiar-extension = pkgs.runCommand "golem-familiar-extension-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
-            cp -r ${./contrib/familiar} ./familiar
-            chmod -R u+w ./familiar
-            bun test ./familiar/pi/agents/resolve.test.ts ./familiar/pi/agents/cli.test.ts ./familiar/pi/agents/extension.test.ts ./familiar/manifest.test.ts
+            mkdir -p ./contrib
+            cp -r ${./contrib/familiar} ./contrib/familiar
+            cp ${./flake.nix} ./flake.nix
+            chmod -R u+w ./contrib/familiar
+            bun test ./contrib/familiar/pi/agents/resolve.test.ts ./contrib/familiar/pi/agents/cli.test.ts ./contrib/familiar/pi/agents/extension.test.ts ./contrib/familiar/manifest.test.ts
             touch $out
           '';
         };

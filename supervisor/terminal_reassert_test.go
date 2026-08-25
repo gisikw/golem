@@ -74,7 +74,7 @@ func TestTerminalEndpointReassertedAfterLostStartingEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	httpServer := httptest.NewServer(service.API{Store: store}.Handler())
+	httpServer := httptest.NewServer(service.API{Store: store, Capabilities: protocol.Capabilities{Name: "host", Harnesses: map[string]protocol.HarnessCapability{"fake": {}}}}.Handler())
 	defer httpServer.Close()
 	s2 := &Supervisor{Host: "host", Client: client.New(httpServer.URL), Registry: reg2, Tmux: s.Tmux, ArtifactRoot: s.ArtifactRoot, AllowedCWDRoots: []string{cwd}, Adapters: s.Adapters, MaxStartAttempts: 2, StartBackoff: time.Nanosecond}
 
@@ -176,7 +176,7 @@ func TestReassertTerminalIsIdempotentWhenRecordMatches(t *testing.T) {
 
 func mustURL(t *testing.T, store *service.Store) string {
 	t.Helper()
-	srv := httptest.NewServer(service.API{Store: store}.Handler())
+	srv := httptest.NewServer(service.API{Store: store, Capabilities: protocol.Capabilities{Name: "host", Harnesses: map[string]protocol.HarnessCapability{"fake": {}}}}.Handler())
 	t.Cleanup(srv.Close)
 	return srv.URL
 }

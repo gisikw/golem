@@ -154,9 +154,31 @@ func TestReapRefusesRunningAndPollsSettledRequest(t *testing.T) {
 	if e != nil || !got.ReapRequested {
 		t.Fatalf("settled reap request: %#v %v", got, e)
 	}
-	poll, e := s.Poll(ctx, "host")
+	poll, e := s.Poll(ctx)
 	if e != nil || len(poll.Assignments) != 1 || !poll.Assignments[0].Job.ReapRequested {
 		t.Fatalf("reap request not delivered to supervisor: %#v %v", poll, e)
+	}
+}
+
+func TestPollOwnsAllJobsRegardlessOfLegacyHostMetadata(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	for _, host := range []string{"old-host-a", "old-host-b"} {
+		if _, err = s.Create(ctx, protocol.CreateJob{IdempotencyKey: host, Harness: "fake", Host: host, Prompt: "go", CWD: "/tmp"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	poll, err := s.Poll(ctx)
+	if err != nil || len(poll.Assignments) != 2 {
+		t.Fatalf("local poll filtered legacy host metadata: %#v %v", poll, err)
+	}
+	job := poll.Assignments[0].Job
+	if err = s.Record(ctx, protocol.EventBatch{Host: "different-name", Events: []protocol.ObservedEvent{{ID: "local-start", JobID: job.ID, State: protocol.Starting}}}); err != nil {
+		t.Fatalf("event was incorrectly host-routed: %v", err)
 	}
 }
 
