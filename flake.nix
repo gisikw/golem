@@ -55,7 +55,11 @@
           '';
         };
         devShells.default = pkgs.mkShell {
-          packages = [ pkgs.go pkgs.tmux pkgs.git pkgs.bun pkgs.bashInteractive ];
+          # pi is pinned here deliberately: workers resolve `pi` from PATH, and an
+          # ambient stale install (e.g. an old npm global) makes hook events
+          # silently vanish and jobs never settle. Other harness CLIs (claude,
+          # codex) intentionally fall through to the system.
+          packages = [ pkgs.go pkgs.tmux pkgs.git pkgs.bun pkgs.bashInteractive pkgs.pi-coding-agent ];
           GOLEM_INTERACTIVE_SHELL = "${pkgs.bashInteractive}/bin/bash";
         };
       });
