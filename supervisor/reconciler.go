@@ -68,6 +68,8 @@ type Supervisor struct {
 	StartBackoff     time.Duration
 	Linger           time.Duration
 	Adapters         map[string]harnesses.Adapter
+	AttachHost       string
+	AttachPort       int
 	Logger           *slog.Logger
 }
 
@@ -304,6 +306,13 @@ func (s *Supervisor) publishState(ctx context.Context, w *Worker, state protocol
 	event := protocol.ObservedEvent{ID: w.Job.ID + "-" + string(state), JobID: w.Job.ID, State: state, ObservedAt: time.Now().UTC()}
 	if state == protocol.Starting || state == protocol.Running {
 		event.Terminal = &protocol.TerminalEndpoint{Host: s.Host, Socket: s.Tmux.Socket, Target: w.Target}
+		if s.AttachPort > 0 {
+			host := s.AttachHost
+			if host == "" {
+				host = s.Host
+			}
+			event.Activation = &protocol.Activation{Type: "ssh", Host: host, Port: s.AttachPort, User: w.Job.ID}
+		}
 	}
 	if err := s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
 		return err
@@ -340,13 +349,25 @@ func (s *Supervisor) reassertTerminal(ctx context.Context, job protocol.Job) {
 		return
 	}
 	want := protocol.TerminalEndpoint{Host: s.Host, Socket: s.Tmux.Socket, Target: w.Target}
-	if job.Terminal != nil && *job.Terminal == want {
+	var activation *protocol.Activation
+	if s.AttachPort > 0 {
+		host := s.AttachHost
+		if host == "" {
+			host = s.Host
+		}
+		activation = &protocol.Activation{Type: "ssh", Host: host, Port: s.AttachPort, User: job.ID}
+	}
+	if job.Terminal != nil && *job.Terminal == want && (activation == nil || job.Activation != nil && *job.Activation == *activation) {
 		return
 	}
 	if !s.Tmux.Has(ctx, w.Session) {
 		return // no live terminal exists; never fabricate a target
 	}
-	event := protocol.ObservedEvent{ID: job.ID + "-terminal", JobID: job.ID, Terminal: &want, ObservedAt: time.Now().UTC()}
+	eventID := job.ID + "-terminal"
+	if activation != nil {
+		eventID += fmt.Sprintf("-ssh-%d", activation.Port)
+	}
+	event := protocol.ObservedEvent{ID: eventID, JobID: job.ID, Terminal: &want, Activation: activation, ObservedAt: time.Now().UTC()}
 	if err := s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
 		s.log().Warn("terminal endpoint reassertion deferred", "job", job.ID, "error", err)
 	}

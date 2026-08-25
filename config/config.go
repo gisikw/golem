@@ -29,7 +29,9 @@ type Project struct {
 }
 
 type AttachSSH struct {
-	Port int `toml:"port"`
+	Port               int    `toml:"port"`
+	HostKeyPath        string `toml:"host_key_path"`
+	AuthorizedKeysPath string `toml:"authorized_keys_path"`
 }
 
 type Config struct {
@@ -107,6 +109,9 @@ func Load(path string) (Config, error) {
 	}
 	if c.AttachSSH.Port < 0 || c.AttachSSH.Port > 65535 {
 		return Config{}, errors.New("attach_ssh.port must be between 0 and 65535")
+	}
+	if c.AttachSSH.Port != 0 && (c.AttachSSH.HostKeyPath == "" || c.AttachSSH.AuthorizedKeysPath == "") {
+		return Config{}, errors.New("attach_ssh.host_key_path and authorized_keys_path are required when enabled")
 	}
 	return c, nil
 }

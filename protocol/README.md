@@ -14,4 +14,4 @@ Lifecycle: `pending → assigned → starting → running ↔ blocked → cancel
 
 Dispatch contains only harness and model identity. Provider connection descriptors and credential references are not protocol fields; golemd provisions pi from operator config and its own environment.
 
-`GET /v1/capabilities` reports the daemon identity, version, configured harness/model offerings, path-free project catalog, clone flag, and future attach port. Dispatches cannot expand that operator-owned catalog.
+`GET /v1/capabilities` reports the daemon identity, version, configured harness/model offerings, path-free project catalog, clone flag, and configured SSH attach port (zero when disabled). Dispatches cannot expand that operator-owned catalog. A live job may carry both a host-local `terminal` tmux endpoint and a location-independent `activation` SSH endpoint; activation is removed at settlement.

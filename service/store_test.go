@@ -53,6 +53,35 @@ func TestSettlementIdempotentAndDurable(t *testing.T) {
 		t.Fatalf("reopen/first settlement: %#v %v", got, e)
 	}
 }
+func TestActivationPublishedAndClearedOnSettlement(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	j := create(t, s)
+	activation := &protocol.Activation{Type: "ssh", Host: "daemon.example", Port: 9922, User: j.ID}
+	if err = s.Record(ctx, protocol.EventBatch{Host: "host", Events: []protocol.ObservedEvent{{ID: "activation-start", JobID: j.ID, State: protocol.Starting, Activation: activation}}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx, j.ID)
+	if err != nil || got.Activation == nil || *got.Activation != *activation {
+		t.Fatalf("activation=%#v err=%v", got.Activation, err)
+	}
+	if err = s.Record(ctx, protocol.EventBatch{Host: "host", Events: []protocol.ObservedEvent{{ID: "activation-run", JobID: j.ID, State: protocol.Running}}}); err != nil {
+		t.Fatal(err)
+	}
+	set := &protocol.Settlement{ID: "activation-settle", JobID: j.ID, State: protocol.Done, At: time.Now()}
+	if err = s.Record(ctx, protocol.EventBatch{Host: "host", Events: []protocol.ObservedEvent{{ID: "activation-terminal", JobID: j.ID, Settlement: set}}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.Get(ctx, j.ID)
+	if err != nil || got.Activation != nil {
+		t.Fatalf("settled activation=%#v err=%v", got.Activation, err)
+	}
+}
+
 func TestAnswerIdempotencyConflict(t *testing.T) {
 	s, e := Open(filepath.Join(t.TempDir(), "db"))
 	if e != nil {

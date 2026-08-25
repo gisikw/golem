@@ -10,8 +10,10 @@ import (
 	"github.com/gisikw/golem/protocol"
 	"github.com/gisikw/golem/supervisor"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -44,7 +46,7 @@ func main() {
 	root.Parse(os.Args[1:])
 	args := root.Args()
 	if len(args) == 0 {
-		fatal(fmt.Errorf("usage: golem [--service URL] [--json] {dispatch|capabilities|status|list|await|events|attach-hint|cancel|reap|answer|gc}"))
+		fatal(fmt.Errorf("usage: golem [--service URL] [--json] {dispatch|capabilities|status|list|await|events|attach|attach-hint|cancel|reap|answer|gc}"))
 	}
 	ctx := context.Background()
 	c := client.New(*endpoint)
@@ -209,6 +211,35 @@ func main() {
 			fatal(e)
 		}
 		print(j)
+	case "attach":
+		need(args, 2)
+		j, e := c.Get(ctx, args[1])
+		if e != nil {
+			fatal(e)
+		}
+		var command string
+		var argv []string
+		if j.Terminal != nil {
+			if info, statErr := os.Stat(j.Terminal.Socket); statErr == nil && info.Mode()&os.ModeSocket != 0 {
+				command = "tmux"
+				argv = []string{"tmux", "-S", j.Terminal.Socket, "attach-session", "-t", j.Terminal.Target}
+			}
+		}
+		if command == "" && j.Activation != nil {
+			command = "ssh"
+			argv = []string{"ssh", "-p", fmt.Sprint(j.Activation.Port), j.Activation.User + "@" + j.Activation.Host}
+		}
+		if command == "" {
+			fatal(errors.New("job has no live attach endpoint"))
+		}
+		path, e := exec.LookPath(command)
+		if e != nil {
+			fatal(e)
+		}
+		fmt.Fprintf(os.Stderr, "golem: exec %s\n", strings.Join(argv, " "))
+		if e = syscall.Exec(path, argv, os.Environ()); e != nil {
+			fatal(e)
+		}
 	case "attach-hint":
 		need(args, 2)
 		j, e := c.Get(ctx, args[1])

@@ -5,14 +5,14 @@ Golem is a standalone delegated-worker system. One `golemd` daemon per host owns
 ## Features
 
 - Durable, idempotent jobs, events, answers, and settlements
-- Interactive, writable tmux sessions with direct attach hints
+- Interactive, writable tmux sessions via local tmux or restricted SSH attach
 - Lifecycle states from `assigned` through running, blocked, and terminal outcomes
 - Persistent named Git workspaces and host-local artifact retention
 - Pi, minimal Claude/Codex, and dependency-free fake harness adapters
 - Operator-advertised harness/model and project capabilities
 - Unix-socket or loopback HTTP JSON API
 
-TCP authentication, SSH attach, project/clone workspace resolution, and portable artifact storage are deferred. Do not expose the HTTP listener beyond loopback or a trusted tunnel.
+HTTP TCP authentication and portable artifact storage are deferred. Do not expose the HTTP listener beyond loopback or a trusted tunnel. The separately configured SSH attach listener is public-key-only and terminal-only.
 
 ## Requirements
 
@@ -36,7 +36,7 @@ go run ./cmd/golem --service "$endpoint" \
   dispatch --harness fake --cwd /tmp 'exercise the worker lifecycle'
 go run ./cmd/golem --service "$endpoint" list
 go run ./cmd/golem --service "$endpoint" await JOB_ID
-go run ./cmd/golem --service "$endpoint" attach-hint JOB_ID
+go run ./cmd/golem --service "$endpoint" attach JOB_ID
 ```
 
 With no `--service`, the CLI uses `unix://~/.local/state/golem/golemd.sock`, matching golemd's default state directory. The smoke test automates the complete flow:
@@ -54,7 +54,7 @@ With no `--service`, the CLI uses `unix://~/.local/state/golem/golemd.sock`, mat
 - `[projects.<name>]`: an absolute existing `path` and optional `description`
 - `[providers.<name>]`: pi `base_url` and optional `api_key_env`
 - `clone_enabled` (defaults false)
-- `api_bearer_tokens` and `[attach_ssh] port` placeholders for later phases
+- `[attach_ssh]`: optional port, host key path, and authorized_keys path (port 0 disables it)
 
 Project paths and pi provider/model references are validated at startup. Dispatch selects either `--project NAME` or `--repo URL` plus `--worktree NAME`; the resulting `.golem/worktrees/NAME` is reused as the resume key. Repository cloning requires `clone_enabled`. Direct absolute `--cwd` remains a low-level test/fake-harness escape hatch.
 
@@ -65,7 +65,7 @@ Provider descriptors and credentials are not accepted over the wire. For pi, `<p
 - `capabilities`
 - `dispatch` (`--project` or `--repo`, plus a named `--worktree`; low-level `--cwd`)
 - `status`, `list [--state]`, and `await`
-- `attach-hint`, `answer`, `cancel`, and `reap`
+- `attach` (local tmux fast path, otherwise SSH), `attach-hint`, `answer`, `cancel`, and `reap`
 - `gc --root DIR --older-than DURATION`
 
 Use global `--json` for machine-readable output. `--service` accepts `unix:///path` or an HTTP loopback URL.
