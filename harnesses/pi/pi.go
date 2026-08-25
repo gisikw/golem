@@ -195,6 +195,11 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 			}
 			entry["apiKey"] = key
 			entry["authHeader"] = true
+		} else {
+			// pi requires an apiKey before a model appears in /model, even for
+			// keyless OpenAI-compatible servers (see pi docs/models.md). Keep the
+			// documented dummy-value workaround for auth-free providers.
+			entry["apiKey"] = "golem-keyless"
 		}
 		modelsJSON, err := json.MarshalIndent(map[string]any{"providers": map[string]any{provider: entry}}, "", "  ")
 		if err != nil {
