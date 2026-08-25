@@ -314,7 +314,7 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 				settlementInserted = true
 			}
 		}
-		if ev.Settlement != nil && !settlementInserted && ev.State == "" && ev.Progress == nil && ev.Question == nil && ev.Terminal == nil {
+		if ev.Settlement != nil && !settlementInserted && ev.State == "" && ev.Progress == nil && ev.Question == nil && ev.Terminal == nil && ev.Activation == nil {
 			continue // first settlement is immutable; later attempts are true no-ops
 		}
 		if next != "" {
@@ -331,6 +331,15 @@ func (s *Store) Record(ctx context.Context, batch protocol.EventBatch) error {
 				return errors.New("invalid terminal endpoint")
 			}
 			j.Terminal = ev.Terminal
+		}
+		if ev.Activation != nil {
+			if ev.Activation.Type != "ssh" || ev.Activation.Host == "" || ev.Activation.Port < 1 || ev.Activation.Port > 65535 || ev.Activation.User != j.ID {
+				return errors.New("invalid activation endpoint")
+			}
+			j.Activation = ev.Activation
+		}
+		if ev.Settlement != nil {
+			j.Activation = nil // settled/dead panes are never remotely attachable
 		}
 		if ev.Question != nil {
 			if j.State != protocol.Blocked {

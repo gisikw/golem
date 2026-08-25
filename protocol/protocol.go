@@ -129,6 +129,13 @@ type TerminalEndpoint struct {
 	Target string `json:"target"`
 }
 
+type Activation struct {
+	Type string `json:"type"`
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	User string `json:"user"`
+}
+
 // WorkspaceSelector identifies a provisioned project or managed clone.
 // Worktree is the durable resume key within that workspace.
 type WorkspaceSelector struct {
@@ -164,6 +171,7 @@ type Job struct {
 	LastProgress    *Progress          `json:"last_progress,omitempty"`
 	Settlement      *Settlement        `json:"settlement,omitempty"`
 	Terminal        *TerminalEndpoint  `json:"terminal,omitempty"`
+	Activation      *Activation        `json:"activation,omitempty"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
 }
@@ -315,6 +323,7 @@ type ObservedEvent struct {
 	Question   *BlockedQuestion  `json:"question,omitempty"`
 	Settlement *Settlement       `json:"settlement,omitempty"`
 	Terminal   *TerminalEndpoint `json:"terminal,omitempty"`
+	Activation *Activation       `json:"activation,omitempty"`
 	ObservedAt time.Time         `json:"observed_at,omitempty"`
 }
 

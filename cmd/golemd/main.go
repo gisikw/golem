@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,11 +17,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gisikw/golem/attachssh"
 	"github.com/gisikw/golem/client"
 	golemconfig "github.com/gisikw/golem/config"
 	piadapter "github.com/gisikw/golem/harnesses/pi"
 	"github.com/gisikw/golem/service"
 	"github.com/gisikw/golem/supervisor"
+	gliderssh "github.com/gliderlabs/ssh"
 )
 
 const version = "0.1.0"
@@ -160,7 +163,33 @@ func main() {
 	if *socket == "" {
 		internalEndpoint = "http://" + *listen
 	}
-	sup := &supervisor.Supervisor{Host: cfg.Name, Client: client.New(internalEndpoint), Registry: registry, Tmux: tmux, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters}
+	sup := &supervisor.Supervisor{Host: cfg.Name, Client: client.New(internalEndpoint), Registry: registry, Tmux: tmux, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters, AttachHost: cfg.Name, AttachPort: cfg.AttachSSH.Port}
+
+	var sshServer *attachssh.Server
+	if cfg.AttachSSH.Port != 0 {
+		hostSigner, keyErr := attachssh.LoadOrCreateHostKey(cfg.AttachSSH.HostKeyPath)
+		if keyErr != nil {
+			slog.Error("SSH host key", "error", keyErr)
+			os.Exit(1)
+		}
+		authorized, keysErr := attachssh.LoadAuthorizedKeys(cfg.AttachSSH.AuthorizedKeysPath)
+		if keysErr != nil {
+			slog.Error("SSH authorized keys", "error", keysErr)
+			os.Exit(1)
+		}
+		sshListener, listenErr := net.Listen("tcp", fmt.Sprintf(":%d", cfg.AttachSSH.Port))
+		if listenErr != nil {
+			slog.Error("SSH attach listen", "error", listenErr)
+			os.Exit(1)
+		}
+		sshServer = attachssh.New(registry, tmux, hostSigner, authorized)
+		go func() {
+			slog.Info("listening", "component", "attach-ssh", "address", sshListener.Addr())
+			if serveErr := sshServer.Serve(sshListener); serveErr != nil && !errors.Is(serveErr, gliderssh.ErrServerClosed) {
+				slog.Error("SSH attach serve", "error", serveErr)
+			}
+		}()
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -176,6 +205,9 @@ func main() {
 			shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			for _, server := range servers {
 				_ = server.Shutdown(shutdown)
+			}
+			if sshServer != nil {
+				_ = sshServer.Shutdown(shutdown)
 			}
 			cancel()
 			return

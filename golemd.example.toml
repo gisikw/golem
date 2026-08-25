@@ -23,6 +23,10 @@ models = ["anthropic/claude-sonnet-4"]
 path = "/tmp"
 description = "Local scratch space"
 
-# Declared for the future SSH attach daemon; no listener is started yet.
+# Optional restricted SSH terminal attach endpoint. Port 0 (or an absent
+# section) disables it. The host key is generated once if absent; authorized
+# client keys use standard OpenSSH authorized_keys format.
 [attach_ssh]
 port = 0
+host_key_path = "/tmp/golemd-attach-host-key"
+authorized_keys_path = "/tmp/golemd-authorized-keys"

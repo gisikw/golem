@@ -127,6 +127,7 @@ func (a API) create(w http.ResponseWriter, r *http.Request) {
 		failure(w, err, 400)
 		return
 	}
+	a.publicJob(&j)
 	output(w, 201, j)
 }
 func (a API) list(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +135,9 @@ func (a API) list(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		failure(w, err, 400)
 		return
+	}
+	for i := range j {
+		a.publicJob(&j[i])
 	}
 	output(w, 200, j)
 }
@@ -147,7 +151,13 @@ func (a API) get(w http.ResponseWriter, r *http.Request) {
 		failure(w, err, status)
 		return
 	}
+	a.publicJob(&j)
 	output(w, 200, j)
+}
+func (a API) publicJob(j *protocol.Job) {
+	if a.Capabilities.AttachPort == 0 || j.State.Terminal() || j.Activation != nil && j.Activation.Port != a.Capabilities.AttachPort {
+		j.Activation = nil
+	}
 }
 func (a API) cancel(w http.ResponseWriter, r *http.Request) {
 	j, err := a.Store.Cancel(r.Context(), r.PathValue("id"))
@@ -155,6 +165,7 @@ func (a API) cancel(w http.ResponseWriter, r *http.Request) {
 		failure(w, err, 400)
 		return
 	}
+	a.publicJob(&j)
 	output(w, 200, j)
 }
 func (a API) reap(w http.ResponseWriter, r *http.Request) {
@@ -163,6 +174,7 @@ func (a API) reap(w http.ResponseWriter, r *http.Request) {
 		failure(w, err, 400)
 		return
 	}
+	a.publicJob(&j)
 	output(w, 200, j)
 }
 func (a API) answer(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +188,7 @@ func (a API) answer(w http.ResponseWriter, r *http.Request) {
 		failure(w, err, 400)
 		return
 	}
+	a.publicJob(&j)
 	output(w, 200, j)
 }
 func (a API) poll(w http.ResponseWriter, r *http.Request) {
