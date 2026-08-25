@@ -14,6 +14,9 @@ test("manifest is exact v1 and points only into the Golem contribution", () => {
   expect(manifest).toContain('[chrome]');
   expect(manifest).toContain('render_url = "http://127.0.0.1:7340/v1/render"');
   expect(manifest).toContain('[pi.env]');
+  expect(manifest).toContain('env = { GOLEM_HOOK_EXTENSION = "${plugin_root}/integrations/pi/agent-hooks/index.ts", GOLEM_HOST = "localhost" }');
+  expect(manifest).toContain('GOLEM_HOST = "localhost"');
+  expect(manifest.match(/GOLEM_HOST\s*=\s*"localhost"/g)?.length).toBe(2);
   expect(manifest).toContain('GOLEM_CLI_ARGV_JSON = "[\\"nix\\", \\"run\\", \\"${plugin_root}#golem\\", \\"--\\"]"');
   expect(manifest).not.toContain('[render]');
   expect(manifest).not.toContain('[nav]');

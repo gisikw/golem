@@ -11,7 +11,7 @@ name = "golem-supervisor"
 argv = ["nix", "run", "${plugin_root}#golem-supervisor"]
 depends_on = ["golem-service"]
 required = false
-env = { GOLEM_HOOK_EXTENSION = "${plugin_root}/integrations/pi/agent-hooks/index.ts" }
+env = { GOLEM_HOOK_EXTENSION = "${plugin_root}/integrations/pi/agent-hooks/index.ts", GOLEM_HOST = "localhost" }
 
 [[services]]
 name = "golem-familiar-render"
@@ -24,6 +24,7 @@ probe = { type = "http", url = "http://127.0.0.1:7340/live" }
 extensions = ["${plugin_root}/contrib/familiar/pi/agents"]
 
 [pi.env]
+GOLEM_HOST = "localhost"
 GOLEM_CLI_ARGV_JSON = "[\"nix\", \"run\", \"${plugin_root}#golem\", \"--\"]"
 
 [chrome]
