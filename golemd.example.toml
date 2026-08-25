@@ -4,6 +4,10 @@ name = "local"
 clone_enabled = false
 api_bearer_tokens = [] # Declared for future enforcement.
 
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "" # Set to an environment variable name to enable auth.
+
 [harnesses.fake]
 models = []
 
@@ -13,12 +17,12 @@ models = ["openai/gpt-5.6"]
 [harnesses.claude]
 models = ["anthropic/claude-sonnet-4"]
 
-# Project paths must be absolute existing directories. Project-based workspace
-# selection is planned for Phase 2; Phase 1 advertises this catalog only.
+# Project paths must be absolute existing directories. Dispatch selects these
+# by name and uses a durable worktree name as its resume key.
 [projects.scratch]
 path = "/tmp"
 description = "Local scratch space"
 
-# Declared for the future SSH attach daemon; no listener is started in Phase 1.
+# Declared for the future SSH attach daemon; no listener is started yet.
 [attach_ssh]
 port = 0

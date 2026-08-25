@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -282,14 +281,6 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 	if err = os.MkdirAll(j.Artifacts.Directory, 0o700); err != nil {
 		return err
 	}
-	worktree := ""
-	if j.Isolation == protocol.IsolationWorktree {
-		worktree = filepath.Join(j.Artifacts.Directory, "worktree")
-		if out, worktreeErr := exec.CommandContext(ctx, "git", "-C", j.CWD, "worktree", "add", "--detach", worktree, "HEAD").CombinedOutput(); worktreeErr != nil {
-			return fmt.Errorf("git worktree: %s: %w", out, worktreeErr)
-		}
-		j.CWD = worktree
-	}
 	launch, err := a.Start(ctx, j)
 	if err != nil {
 		return err
@@ -298,7 +289,7 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 	if err != nil {
 		return err
 	}
-	w := Worker{Job: j, Launch: launch, Session: session, Target: target, Worktree: worktree, RestartUntil: time.Now().Add(s.OfflineWindow), LastState: protocol.Starting, StartedAt: time.Now().UTC()}
+	w := Worker{Job: j, Launch: launch, Session: session, Target: target, RestartUntil: time.Now().Add(s.OfflineWindow), LastState: protocol.Starting, StartedAt: time.Now().UTC()}
 	if err = s.Registry.Put(w); err != nil {
 		return err
 	}

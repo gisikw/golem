@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/gisikw/golem/protocol"
 	"github.com/pelletier/go-toml/v2"
@@ -15,6 +16,11 @@ import (
 
 type Harness struct {
 	Models []string `toml:"models"`
+}
+
+type Provider struct {
+	BaseURL   string `toml:"base_url"`
+	APIKeyEnv string `toml:"api_key_env"`
 }
 
 type Project struct {
@@ -27,12 +33,13 @@ type AttachSSH struct {
 }
 
 type Config struct {
-	Name            string             `toml:"name"`
-	Harnesses       map[string]Harness `toml:"harnesses"`
-	Projects        map[string]Project `toml:"projects"`
-	CloneEnabled    bool               `toml:"clone_enabled"`
-	APIBearerTokens []string           `toml:"api_bearer_tokens"`
-	AttachSSH       AttachSSH          `toml:"attach_ssh"`
+	Name            string              `toml:"name"`
+	Harnesses       map[string]Harness  `toml:"harnesses"`
+	Projects        map[string]Project  `toml:"projects"`
+	Providers       map[string]Provider `toml:"providers"`
+	CloneEnabled    bool                `toml:"clone_enabled"`
+	APIBearerTokens []string            `toml:"api_bearer_tokens"`
+	AttachSSH       AttachSSH           `toml:"attach_ssh"`
 }
 
 func Load(path string) (Config, error) {
@@ -67,6 +74,25 @@ func Load(path string) (Config, error) {
 			seen[model] = true
 		}
 	}
+	for name, p := range c.Providers {
+		if name == "" || p.BaseURL == "" {
+			return Config{}, fmt.Errorf("provider %q requires base_url", name)
+		}
+		if p.APIKeyEnv != "" && !validEnvName(p.APIKeyEnv) {
+			return Config{}, fmt.Errorf("provider %q has invalid api_key_env", name)
+		}
+	}
+	if pi, ok := c.Harnesses["pi"]; ok {
+		for _, model := range pi.Models {
+			provider, _, found := strings.Cut(model, "/")
+			if !found || provider == "" {
+				return Config{}, fmt.Errorf("pi model %q must be provider/model", model)
+			}
+			if _, found = c.Providers[provider]; !found {
+				return Config{}, fmt.Errorf("pi model %q references missing provider %q", model, provider)
+			}
+		}
+	}
 	for name, p := range c.Projects {
 		if name == "" || !filepath.IsAbs(p.Path) {
 			return Config{}, fmt.Errorf("project %q path must be absolute", name)
@@ -83,6 +109,15 @@ func Load(path string) (Config, error) {
 		return Config{}, errors.New("attach_ssh.port must be between 0 and 65535")
 	}
 	return c, nil
+}
+
+func validEnvName(s string) bool {
+	for i, r := range s {
+		if !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // Capabilities returns a stable, path-free public view of operator config.

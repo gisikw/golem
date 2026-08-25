@@ -9,7 +9,7 @@ import (
 func TestLoadNestedHarnessModelsAndProjects(t *testing.T) {
 	project := t.TempDir()
 	path := filepath.Join(t.TempDir(), "golemd.toml")
-	data := "name = \"laptop\"\nclone_enabled = false\n[attach_ssh]\nport = 2222\n[harnesses.pi]\nmodels = [\"openai/gpt-5.6\"]\n[harnesses.fake]\nmodels = []\n[projects.demo]\npath = \"" + project + "\"\ndescription = \"Demo\"\n"
+	data := "name = \"laptop\"\nclone_enabled = false\n[providers.openai]\nbase_url = \"https://api.openai.com/v1\"\napi_key_env = \"\"\n[attach_ssh]\nport = 2222\n[harnesses.pi]\nmodels = [\"openai/gpt-5.6\"]\n[harnesses.fake]\nmodels = []\n[projects.demo]\npath = \"" + project + "\"\ndescription = \"Demo\"\n"
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
