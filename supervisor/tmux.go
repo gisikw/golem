@@ -70,7 +70,7 @@ func (t Tmux) Prepare() error {
 	// (the operator hates lingering dead panes). The worker pane still needs
 	// remain-on-exit so the supervisor can read pane_dead/exit-status after death
 	// (see Pane()); that is applied per-window, not globally.
-	policy := "# Golem Agent Supervisor complete private tmux policy.\nset-option -g status off\nset-option -g pane-border-status off\nset-option -g remain-on-exit off\nset-option -g exit-empty off\nset-option -g destroy-unattached off\nset-option -g allow-rename off\nset-option -g prefix C-b\nunbind-key C-b\nbind-key C-b send-prefix\nset-option -g mouse on\nbind-key -n PageUp if-shell -F '#{alternate_on}' 'send-keys PageUp' 'copy-mode -eu'\nset-option -g allow-passthrough on\nset-option -g extended-keys on\nset-option -g extended-keys-format csi-u\nset-option -g terminal-features 'xterm*:RGB:extkeys,screen*:extkeys,tmux*:RGB:extkeys,kitty*:RGB:extkeys,ghostty*:RGB:extkeys,xterm-ghostty:RGB:extkeys'\n"
+	policy := "# Golem Agent Supervisor complete private tmux policy.\nset-option -g status off\nset-option -g pane-border-status off\nset-option -g remain-on-exit off\nset-option -g exit-empty off\nset-option -g destroy-unattached off\nset-option -g allow-rename off\nset-option -g prefix C-b\nunbind-key -a -T prefix\nbind-key -T prefix C-b send-prefix\nbind-key -T prefix d detach-client\nunbind-key -T root MouseDown3Pane\nunbind-key -T root M-MouseDown3Pane\nunbind-key -T root MouseDown1Status\nunbind-key -T root MouseDown3Status\nunbind-key -T root MouseDown3StatusLeft\nunbind-key -T root M-MouseDown3Status\nunbind-key -T root M-MouseDown3StatusLeft\nset-option -g mouse on\nbind-key -n PageUp if-shell -F '#{alternate_on}' 'send-keys PageUp' 'copy-mode -eu'\nset-option -g allow-passthrough on\nset-option -g extended-keys on\nset-option -g extended-keys-format csi-u\nset-option -g terminal-features 'xterm*:RGB:extkeys,screen*:extkeys,tmux*:RGB:extkeys,kitty*:RGB:extkeys,ghostty*:RGB:extkeys,xterm-ghostty:RGB:extkeys'\n"
 	// default-shell: prefer an interactive bash for windows/panes a human opens.
 	// Empty preserves tmux's compiled default. The path must contain no double
 	// quote (it is embedded in a quoted set-option value).
@@ -206,6 +206,34 @@ func (t Tmux) Start(ctx context.Context, id string, l harnesses.Launch) (string,
 func (t Tmux) Kill(ctx context.Context, session string) error {
 	_, err := t.run(ctx, "kill-session", "-t", session)
 	return err
+}
+
+// KillServer tears down the complete private process boundary. All worker
+// panes belong to this server, so killing it also kills every worker process.
+// It is intentionally idempotent for shutdown paths where no worker ever
+// caused the lazy tmux server to be created.
+func (t Tmux) KillServer(ctx context.Context) error {
+	if !t.ServerAlive(ctx) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		t.removeSocket()
+		return nil
+	}
+	if _, err := t.run(ctx, "kill-server"); err != nil {
+		return err
+	}
+	// Some tmux versions leave the now-inert Unix socket node behind briefly.
+	// Remove only a socket at the private prepared path; never unlink an
+	// unexpected replacement.
+	t.removeSocket()
+	return nil
+}
+
+func (t Tmux) removeSocket() {
+	if fi, err := os.Lstat(t.Socket); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		_ = os.Remove(t.Socket)
+	}
 }
 func (t Tmux) Interrupt(ctx context.Context, target string) error {
 	_, err := t.run(ctx, "send-keys", "-t", target, "C-c")

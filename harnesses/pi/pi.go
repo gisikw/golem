@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gisikw/golem/harnesses"
+	piintegration "github.com/gisikw/golem/integrations/pi"
 	"github.com/gisikw/golem/protocol"
 )
 
@@ -35,9 +36,10 @@ import (
 // so the operator's personal profile can never leak in through ambient env.
 type Adapter struct {
 	Binary string
-	// HookExtension is the agent-hooks side-channel extension path. When empty
-	// no lifecycle is reported over the side channel and the worker settles only
-	// on process death (supervisor crash boundary).
+	// HookExtension optionally overrides the built-in agent-hooks side-channel
+	// extension. When empty, the embedded signed-off extension is materialized
+	// into the worker's private profile; lifecycle observation is never silently
+	// disabled.
 	HookExtension string
 	// WebExtension is the optional self-contained web (search + fetch) extension.
 	// It carries no operator-specific state; its SSRF guard defaults to
@@ -59,7 +61,15 @@ type Adapter struct {
 	// matches the operator's; job.Model (--model) still overrides at launch.
 	DefaultProvider string
 	DefaultModel    string
+	Providers       map[string]Provider
 	Env             map[string]string
+}
+
+// Provider is operator-owned connection configuration. APIKeyEnv names a
+// variable in golemd's environment; its value is read only while provisioning.
+type Provider struct {
+	BaseURL   string
+	APIKeyEnv string
 }
 
 // EventsEnv names the side-channel path the hook extension writes to.
@@ -83,17 +93,6 @@ func (a Adapter) bin() string {
 		return a.Binary
 	}
 	return "pi"
-}
-
-// modelArg is the pi --model argument. A resolved ProviderConfig pins the exact
-// dispatched provider/model (canonical reference so pi selects that provider's
-// model, not a fuzzy match across providers); otherwise the bare job.Model is
-// used, matching pre-fix behavior.
-func modelArg(j protocol.Job) string {
-	if pc := j.ProviderConfig; pc != nil && pc.Provider != "" && pc.Model != "" {
-		return pc.Provider + "/" + pc.Model
-	}
-	return j.Model
 }
 
 // paths returns the session JSONL, pane transcript, and side-channel events
@@ -145,13 +144,11 @@ func (a Adapter) workerExtensions() []string {
 // so the extension set must live in exactly one place, and settings.json is the
 // single file the leak-guard test can audit.
 //
-// When pc is non-nil (the operator resolved the dispatched model+provider at
-// dispatch time) the worker is provisioned with EXACTLY that one provider+model
-// and nothing else: a single-provider models.json (unless the provider is a pi
-// built-in), defaults pinned to it, and enabledModels scoped to the one
-// "provider/model". This is the fix for the operator's routed catalog
-// otherwise collapsing to whatever happens to sit in models-store.json.
-func (a Adapter) writeWorkerProfile(dir string, pc *protocol.ProviderConfig) error {
+// When a model is dispatched, its operator-configured provider is provisioned
+// with exactly that model and nothing else: a single-provider models.json,
+// pinned defaults, and one enabledModels entry. Any API key is read from the
+// daemon environment at this point and never enters protocol or store data.
+func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -165,14 +162,31 @@ func (a Adapter) writeWorkerProfile(dir string, pc *protocol.ProviderConfig) err
 			model = sm
 		}
 	}
-	if pc != nil && pc.Provider != "" {
-		provider, model = pc.Provider, pc.Model
+	configured := false
+	if dispatchedModel != "" {
+		var ok bool
+		provider, model, ok = strings.Cut(dispatchedModel, "/")
+		if !ok || provider == "" || model == "" {
+			return fmt.Errorf("pi model %q must be provider/model", dispatchedModel)
+		}
+		if _, ok = a.Providers[provider]; !ok {
+			return fmt.Errorf("pi provider %q is not configured", provider)
+		}
+		configured = true
+	}
+	extensions := a.workerExtensions()
+	if a.HookExtension == "" {
+		builtIn, err := piintegration.WriteHooks(dir)
+		if err != nil {
+			return err
+		}
+		extensions = append([]string{builtIn}, extensions...)
 	}
 	settings := map[string]any{
 		"lastChangelogVersion": "0.84.1",
 		// Omit the compaction key entirely: pi's native default (enabled) applies.
 		// Workers have no custom handoff machinery; pi compacts natively.
-		"extensions": a.workerExtensions(),
+		"extensions": extensions,
 	}
 	if provider != "" {
 		settings["defaultProvider"] = provider
@@ -180,28 +194,32 @@ func (a Adapter) writeWorkerProfile(dir string, pc *protocol.ProviderConfig) err
 	if model != "" {
 		settings["defaultModel"] = model
 	}
-	switch {
-	case pc != nil && len(pc.ModelsJSON) > 0:
-		// The single dispatched provider. Write it as pi's models.json (custom
-		// provider layer: baseUrl/apiKey-ref/api/models). apiKey is an unresolved
-		// reference (!cmd/$ENV), resolved on the worker host at runtime — no
-		// plaintext secret is written here. Do NOT copy the operator
-		// models-store.json: the worker must see ONLY this provider.
-		if err := os.WriteFile(filepath.Join(dir, "models.json"), pc.ModelsJSON, 0o600); err != nil {
+	if configured {
+		p := a.Providers[provider]
+		modelEntry := map[string]any{"id": model, "name": model, "reasoning": false, "input": []string{"text"}, "cost": map[string]int{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 131072, "maxTokens": 16384}
+		entry := map[string]any{"name": provider, "baseUrl": p.BaseURL, "api": "openai-completions", "models": []map[string]any{modelEntry}}
+		if p.APIKeyEnv != "" {
+			key, ok := os.LookupEnv(p.APIKeyEnv)
+			if !ok || key == "" {
+				return fmt.Errorf("pi provider %q requires daemon environment %s", provider, p.APIKeyEnv)
+			}
+			entry["apiKey"] = key
+			entry["authHeader"] = true
+		} else {
+			// pi requires an apiKey before a model appears in /model, even for
+			// keyless OpenAI-compatible servers (see pi docs/models.md). Keep the
+			// documented dummy-value workaround for auth-free providers.
+			entry["apiKey"] = "golem-keyless"
+		}
+		modelsJSON, err := json.MarshalIndent(map[string]any{"providers": map[string]any{provider: entry}}, "", "  ")
+		if err != nil {
 			return err
 		}
-		if provider != "" && model != "" {
-			settings["enabledModels"] = []string{provider + "/" + model}
+		if err = os.WriteFile(filepath.Join(dir, "models.json"), modelsJSON, 0o600); err != nil {
+			return err
 		}
-	case pc != nil && pc.Builtin:
-		// A pi built-in provider whose credentials live in auth.json. Nothing to
-		// write to models.json; scope to the single model and rely on auth copy.
-		if provider != "" && model != "" {
-			settings["enabledModels"] = []string{provider + "/" + model}
-		}
-	default:
-		// Back-compat: no resolved provider config. Copy the operator catalog so
-		// job.Model resolves the same set (this is the pre-fix behavior).
+		settings["enabledModels"] = []string{provider + "/" + model}
+	} else {
 		copyProfileFile(a.SourceProfile, dir, "models-store.json")
 	}
 	// Theme is cosmetic and non-blocking.
@@ -209,7 +227,7 @@ func (a Adapter) writeWorkerProfile(dir string, pc *protocol.ProviderConfig) err
 		settings["theme"] = "golem"
 		settings["themes"] = []string{filepath.Join(dir, "themes")}
 	}
-	if a.CopyAuth || (pc != nil && pc.CopyAuth) {
+	if a.CopyAuth {
 		copyProfileFile(a.SourceProfile, dir, "auth.json")
 	}
 	b, err := json.MarshalIndent(settings, "", "  ")
@@ -288,7 +306,7 @@ func (a Adapter) Start(_ context.Context, j protocol.Job) (harnesses.Launch, err
 	}
 	s, t, ev := paths(j)
 	wd := workerDir(j)
-	if err := a.writeWorkerProfile(wd, j.ProviderConfig); err != nil {
+	if err := a.writeWorkerProfile(wd, j.Model); err != nil {
 		return harnesses.Launch{}, err
 	}
 	// Interactive TUI: no --mode json --print. The positional prompt is
@@ -297,7 +315,7 @@ func (a Adapter) Start(_ context.Context, j protocol.Job) (harnesses.Launch, err
 	// The worker extension set lives in the per-job settings.json, NOT on the
 	// command line, because pi rejects a tool registered twice.
 	v := []string{a.bin(), "--session", s, "--no-context-files", "--no-skills"}
-	if m := modelArg(j); m != "" {
+	if m := j.Model; m != "" {
 		v = append(v, "--model", m)
 	}
 	v = append(v, withBlockSuffix(j.Prompt))
@@ -312,11 +330,11 @@ func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (
 		_, _, l.Events = paths(j)
 	}
 	wd := workerDir(j)
-	if err := a.writeWorkerProfile(wd, j.ProviderConfig); err != nil {
+	if err := a.writeWorkerProfile(wd, j.Model); err != nil {
 		return harnesses.Launch{}, err
 	}
 	l.Argv = []string{a.bin(), "--session", l.Session, "--no-context-files", "--no-skills"}
-	if m := modelArg(j); m != "" {
+	if m := j.Model; m != "" {
 		l.Argv = append(l.Argv, "--model", m)
 	}
 	l.Argv = append(l.Argv, "Continue the interrupted delegated task from the existing session.")

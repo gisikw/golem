@@ -21,6 +21,7 @@ type Worker struct {
 	LastState         protocol.State   `json:"last_state"`
 	LastExit          *int             `json:"last_exit,omitempty"`
 	AnsweredKey       string           `json:"answered_key,omitempty"`
+	SteeredKey        string           `json:"steered_key,omitempty"`
 	ObservationCursor int64            `json:"observation_cursor,omitempty"`
 	StartedAt         time.Time        `json:"started_at"`
 	SettledAt         time.Time        `json:"settled_at,omitempty"`

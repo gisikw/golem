@@ -125,86 +125,65 @@ func TestWorkerSettingsContainsOnlyExpectedExtensions(t *testing.T) {
 	}
 }
 
-// A resolved ProviderConfig provisions the worker with EXACTLY the dispatched
-// provider+model: a single-provider models.json, defaults pinned to it,
-// enabledModels scoped to the one "provider/model", the operator catalog NOT
-// copied, and the launch --model set to the canonical reference. This is the
-// fix for the operator's routed catalog collapsing to local-only.
-func TestProviderConfigProvisionsSingleProvider(t *testing.T) {
+func TestConfiguredProviderProfile(t *testing.T) {
 	dir := t.TempDir()
-	// A source profile whose models-store.json holds only local llama (the
-	// observed bug): it must NOT be copied when a provider config is present.
-	source := filepath.Join(dir, "source-pi")
-	if err := os.MkdirAll(source, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(source, "models-store.json"), []byte(`{"llama.cpp":{"models":[]}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	modelsJSON := `{"providers":{"router-anthropic-work":{"name":"Router","baseUrl":"http://router/anthropic/work","apiKey":"!cat -- /run/tok","authHeader":true,"api":"anthropic-messages","models":[{"id":"claude-fable-5","name":"claude-fable-5","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":200000,"maxTokens":16384}]}}}`
-	pc := &protocol.ProviderConfig{Provider: "router-anthropic-work", Model: "claude-fable-5", ModelsJSON: json.RawMessage(modelsJSON)}
-	adapter := Adapter{Binary: "fake-pi", HookExtension: "/extensions/agent-hooks", SourceProfile: source}
-	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", ProviderConfig: pc, Artifacts: protocol.ArtifactMetadata{Directory: dir}}
-	launch, err := adapter.Start(context.Background(), j)
+	t.Setenv("TEST_LLAMA_KEY", "daemon-secret")
+	a := Adapter{Binary: "fake-pi", Providers: map[string]Provider{"llama": {BaseURL: "https://llama.example/v1", APIKeyEnv: "TEST_LLAMA_KEY"}}}
+	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Model: "llama/Qwen", Artifacts: protocol.ArtifactMetadata{Directory: dir}}
+	launch, err := a.Start(context.Background(), j)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// models.json is written verbatim.
-	mj, err := os.ReadFile(filepath.Join(dir, "pi", "models.json"))
-	if err != nil || !strings.Contains(string(mj), "router-anthropic-work") || !strings.Contains(string(mj), "!cat -- /run/tok") {
-		t.Fatalf("single-provider models.json not written: %q %v", mj, err)
-	}
-	// The operator catalog must NOT leak in (worker sees ONLY the dispatched one).
-	if _, err = os.Stat(filepath.Join(dir, "pi", "models-store.json")); !os.IsNotExist(err) {
-		t.Fatalf("operator models-store.json leaked into single-provider worker: %v", err)
-	}
-	b, err := os.ReadFile(filepath.Join(dir, "pi", "settings.json"))
+	b, err := os.ReadFile(filepath.Join(dir, "pi", "models.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var s struct {
-		DefaultProvider string   `json:"defaultProvider"`
-		DefaultModel    string   `json:"defaultModel"`
-		EnabledModels   []string `json:"enabledModels"`
+	var doc struct {
+		Providers map[string]struct {
+			BaseURL string `json:"baseUrl"`
+			APIKey  string `json:"apiKey"`
+			Models  []struct {
+				ID string `json:"id"`
+			} `json:"models"`
+		} `json:"providers"`
 	}
-	if err = json.Unmarshal(b, &s); err != nil {
+	if err = json.Unmarshal(b, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if s.DefaultProvider != "router-anthropic-work" || s.DefaultModel != "claude-fable-5" {
-		t.Fatalf("defaults not pinned to dispatched provider/model: %+v", s)
+	p := doc.Providers["llama"]
+	if p.BaseURL != "https://llama.example/v1" || p.APIKey != "daemon-secret" || len(p.Models) != 1 || p.Models[0].ID != "Qwen" {
+		t.Fatalf("bad profile: %s", b)
 	}
-	if len(s.EnabledModels) != 1 || s.EnabledModels[0] != "router-anthropic-work/claude-fable-5" {
-		t.Fatalf("worker not scoped to exactly the dispatched model: %+v", s.EnabledModels)
-	}
-	// Launch selects the canonical provider/model reference.
-	joined := strings.Join(launch.Argv, " ")
-	if !strings.Contains(joined, "--model router-anthropic-work/claude-fable-5") {
-		t.Fatalf("launch did not pin the canonical model reference: %v", launch.Argv)
+	if !strings.Contains(strings.Join(launch.Argv, " "), "--model llama/Qwen") {
+		t.Fatalf("model not selected: %v", launch.Argv)
 	}
 }
 
-// A built-in provider (credentials in auth.json) writes no models.json, scopes
-// to the single model, and copies auth.json into the private per-job dir.
-func TestProviderConfigBuiltinCopiesAuth(t *testing.T) {
+func TestBuiltInHookIsMaterializedByDefault(t *testing.T) {
 	dir := t.TempDir()
-	source := filepath.Join(dir, "source-pi")
-	if err := os.MkdirAll(source, 0o700); err != nil {
+	j := protocol.Job{ID: "j", Prompt: "go", CWD: dir, Artifacts: protocol.ArtifactMetadata{Directory: dir}}
+	launch, err := (Adapter{Binary: "pi"}).Start(context.Background(), j)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"anthropic":{"type":"oauth"}}`), 0o600); err != nil {
+	settings, err := os.ReadFile(filepath.Join(dir, "pi", "settings.json"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	pc := &protocol.ProviderConfig{Provider: "anthropic", Model: "claude-fable-5", Builtin: true, CopyAuth: true}
-	adapter := Adapter{Binary: "fake-pi", HookExtension: "/extensions/agent-hooks", SourceProfile: source}
-	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", ProviderConfig: pc, Artifacts: protocol.ArtifactMetadata{Directory: dir}}
-	if _, err := adapter.Start(context.Background(), j); err != nil {
+	var got struct {
+		Extensions []string `json:"extensions"`
+	}
+	if err = json.Unmarshal(settings, &got); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "pi", "models.json")); !os.IsNotExist(err) {
-		t.Fatalf("built-in provider must not write models.json: %v", err)
+	if len(got.Extensions) != 1 || !strings.HasSuffix(got.Extensions[0], "golem-agent-hooks/index.ts") {
+		t.Fatalf("built-in hook missing: %#v", got.Extensions)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "pi", "auth.json")); err != nil {
-		t.Fatalf("built-in provider auth.json not copied: %v", err)
+	if _, err = os.Stat(got.Extensions[0]); err != nil {
+		t.Fatal(err)
+	}
+	if launch.Events == "" || launch.Env[EventsEnv] != launch.Events {
+		t.Fatalf("side-channel not provisioned: %#v", launch)
 	}
 }
 

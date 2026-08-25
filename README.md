@@ -1,117 +1,110 @@
 # Golem
 
-Golem is a standalone delegated-worker system. A SQLite service owns durable jobs, one supervisor per host owns worker processes, a private tmux server owns attachable PTYs, and harness adapters translate worker lifecycle events. `pi` is one supported harness alongside minimal Claude, Codex, and configurable fake/argv workers.
+Golem is a standalone delegated-worker system. One `golemd` daemon per host owns its SQLite job store, supervisor, private tmux server, harness configuration, and durable worker registry. Fleet-aware clients choose which daemon to contact; there is no server-side host scheduling.
 
 ## Features
 
 - Durable, idempotent jobs, events, answers, and settlements
-- Explicit host assignment and bounded offline recovery
-- Interactive, writable tmux sessions with direct attach hints
-- Lifecycle states: pending, assigned, starting, running, blocked, cancelling, done, failed, cancelled, timeout
-- Optional detached Git worktrees and host-local artifact retention
-- Blocking questions, steering, cancellation, settlement callbacks, and usage accounting where the harness supports them
-- Unix-socket or loopback HTTP JSON API
+- Interactive, writable tmux sessions via local tmux or restricted SSH attach
+- Lifecycle states from `assigned` through running, blocked, and terminal outcomes
+- Persistent named Git workspaces and host-local artifact retention
+- Pi, minimal Claude/Codex, and dependency-free fake harness adapters
+- Operator-advertised harness/model and project capabilities
+- Unix-socket or bearer-authenticated TCP HTTP JSON API
+- Bounded artifact listings and secure byte/range retrieval
 
-TCP authentication and portable artifact storage are intentionally deferred. Do not expose the HTTP listener beyond loopback or a trusted tunnel.
+Portable artifact storage remains deferred. The separately configured SSH attach listener is public-key-only and terminal-only.
 
 ## Requirements
 
-- Go 1.23+
-- `tmux`, `bash`, and `git` for supervised workers
-- Nix is optional; the flake provides builds, checks, and a development shell
+Go 1.23+, plus `tmux`, `bash`, and `git` for supervised workers. Nix is optional.
 
 ## Quick start
 
+The checked-in [`golemd.example.toml`](golemd.example.toml) is runnable as-is (its example project is `/tmp`):
+
 ```sh
 state=$(mktemp -d)
-go run ./cmd/golem-service \
-  --db "$state/service.db" --unix "$state/service.sock" --listen ''
+go run ./cmd/golemd --config ./golemd.example.toml --state "$state"
 ```
 
-In a second shell:
+In another shell, address that daemon's Unix socket:
 
 ```sh
-go run ./cmd/golem-supervisor \
-  --service "unix://$state/service.sock" \
-  --host local --state "$state/host" \
-  --allowed-cwd-roots "$HOME"
+endpoint="unix://$state/golemd.sock"
+go run ./cmd/golem --service "$endpoint" capabilities
+go run ./cmd/golem --service "$endpoint" \
+  dispatch --harness fake --cwd /tmp 'exercise the worker lifecycle'
+go run ./cmd/golem --service "$endpoint" list
+go run ./cmd/golem --service "$endpoint" await JOB_ID
+go run ./cmd/golem --service "$endpoint" attach JOB_ID
 ```
 
-Then dispatch the dependency-free fake harness:
+With no `--service`, the CLI uses `unix://~/.local/state/golem/golemd.sock`, matching golemd's default state directory. The smoke test automates the complete flow:
 
 ```sh
-go run ./cmd/golem --service "unix://$state/service.sock" \
-  dispatch --host local --harness fake --cwd "$PWD" \
-  'exercise the worker lifecycle'
-go run ./cmd/golem --service "unix://$state/service.sock" list
-go run ./cmd/golem --service "unix://$state/service.sock" attach-hint JOB_ID
+./test/standalone-smoke.sh
 ```
 
-Each shell must receive the same `state` value; using a fixed path instead of `mktemp` is often simpler.
+## Operator configuration
+
+`golemd --config PATH` requires TOML. It defines:
+
+- `name`: this daemon's identity
+- `[harnesses.<name>] models = [...]`: verbatim model IDs scoped to that harness
+- `[projects.<name>]`: an absolute existing `path` and optional `description`
+- `[providers.<name>]`: pi `base_url` and optional `api_key_env`
+- `clone_enabled` (defaults false)
+- `api_bearer_tokens`: bearer credentials enforced on every TCP request; Unix sockets are exempt
+- `[attach_ssh]`: optional port, host key path, and authorized_keys path (port 0 disables it)
+
+Project paths and pi provider/model references are validated at startup. Dispatch selects either `--project NAME` or `--repo URL` plus `--worktree NAME`; the resulting `.golem/worktrees/NAME` is reused as the resume key. Repository cloning requires `clone_enabled`. Direct absolute `--cwd` remains a low-level test/fake-harness escape hatch.
+
+Provider descriptors and credentials are not accepted over the wire. For pi, `<provider>/<model>` resolves against operator config and `api_key_env` is read from golemd's own environment only while its private per-job profile is written.
+
+## CLI commands
+
+- `capabilities`
+- `dispatch` (`--project` or `--repo`, plus a named `--worktree`; low-level `--cwd`)
+- `status`, `list [--state]`, and `await`
+- `artifacts JOB-ID` and `artifacts JOB-ID PATH [-o FILE]`
+- `attach` (local tmux fast path, otherwise SSH), `attach-hint`, `answer`, `steer`, `cancel`, and `reap`
+- `gc --root DIR --older-than DURATION`
+
+Use global `--json` for machine-readable output. `--service` accepts `unix:///path` or an HTTP URL. For TCP, pass `--token TOKEN` or set `GOLEM_TOKEN`.
+
+## Remote HTTP access
+
+Configure one or more `api_bearer_tokens`, then bind explicitly, for example `golemd --listen 100.64.0.10:7341`. TCP requests, including SSE, require `Authorization: Bearer TOKEN`; the Unix socket remains protected by filesystem permissions instead. An empty token list is accepted only on a loopback bind and produces a development warning. Golemd does not terminate TLS: use a trusted tailnet or tunnel as the transport-security layer.
+
+For a machine outside the tailnet, keep golemd on loopback and tunnel it over SSH:
+
+```sh
+ssh -N -L 7341:127.0.0.1:7341 worker-host
+GOLEM_ENDPOINT=http://127.0.0.1:7341 GOLEM_TOKEN="$TOKEN" golem capabilities
+```
+
+The bearer token still authenticates the tunneled request; SSH supplies confidentiality in transit.
 
 ## Build and test
 
 ```sh
 go test ./...
-go build ./cmd/...
-# or
-nix flake check
-nix develop
+go build ./...
+go vet ./...
+./test/standalone-smoke.sh
 ```
-
-The bundled pi event-shaping tests can also be run with `bun test integrations/pi/agent-hooks/events.test.ts` (Bun is included in the Nix development shell).
-
-## Commands
-
-The `golem` CLI supports:
-
-- `dispatch` (`--host` is required; `--worktree` requests detached-worktree isolation)
-- `status`, `list [--state]`, and `await`
-- `attach-hint`
-- `answer`, `cancel`, and `reap`
-- `gc --root DIR --older-than DURATION`
-
-Use global `--json` for machine-readable output.
-
-## Configuration
-
-Service variables:
-
-- `GOLEM_DB`, `GOLEM_SOCKET`, `GOLEM_LISTEN` (defaults: `golem.db`, `golem.sock`, and `127.0.0.1:7337`)
-
-Supervisor variables:
-
-- `GOLEM_ENDPOINT`, `GOLEM_HOST`, `GOLEM_SUPERVISOR_STATE`
-- `GOLEM_ARTIFACT_ROOT`, `GOLEM_ALLOWED_CWD_ROOTS`, `GOLEM_LINGER_SECONDS`
-- `GOLEM_INTERACTIVE_SHELL`, `GOLEM_TMUX_THEME_CONFIG`
-- `GOLEM_CLAUDE_ARGV`, `GOLEM_CODEX_ARGV` (JSON argv arrays)
-- `GOLEM_SETTLEMENT_WEBHOOK`, `GOLEM_WORKLIST_DIR`
-
-Pi harness variables:
-
-- `GOLEM_PI`
-- `GOLEM_HOOK_EXTENSION` (normally `integrations/pi/agent-hooks/index.ts`)
-- `GOLEM_WEB_EXTENSION` (optional external extension)
-- `GOLEM_PI_SOURCE_PROFILE` (optional model/default/theme source)
-- `GOLEM_PI_DEFAULT_PROVIDER`, `GOLEM_PI_DEFAULT_MODEL`
-- `GOLEM_COPY_AUTH=1` (explicitly opts into copying `auth.json` to private job state)
-
-The supervisor defaults state to `~/.local/state/golem/supervisor`; artifacts live below it unless overridden. Allowed working-directory roots default to the user's home and are separated with the OS path-list separator.
-
-## Harness behavior
-
-Interactive harnesses own their tmux pane directly; tmux scrollback is the human-readable record and lifecycle is observed through a side channel. Minimal argv harnesses preserve output in both the pane and an artifact transcript while Bash `pipefail` retains the worker exit status.
-
-The pi adapter creates an isolated `PI_CODING_AGENT_DIR` under each job's artifact directory. It loads only explicitly configured worker extensions, not the operator's extension list. The bundled `agent-hooks` extension emits lifecycle events and provides `agents_block` for explicit operator questions. A `ProviderConfig` can scope a worker to one provider/model; credential fields must remain unresolved host-side references. Copying stored pi authentication is disabled by default.
 
 ## API and architecture
 
-Both listeners expose:
+The listener exposes:
 
+- `GET /v1/capabilities`
 - `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`
-- `POST /v1/jobs/{id}/{cancel,reap,answer}`
-- `POST /v1/hosts/{host}/poll`
-- `POST /v1/events`
+- `GET /v1/jobs/{id}/artifacts` and `GET /v1/jobs/{id}/artifacts/{path...}`
+- `GET /v1/events?since=SEQ[&job=ID]` (durable replay + live SSE)
+- `POST /v1/jobs/{id}/{cancel,reap,answer,steer}`
+- internal local reconciliation via `POST /v1/jobs/poll` and `POST /v1/events`
 - `GET /live`, `GET /ready`
 
 See [`protocol/README.md`](protocol/README.md) for the wire contract and [`DECISIONS.md`](DECISIONS.md) for architecture and security boundaries.

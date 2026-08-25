@@ -1,0 +1,35 @@
+# golemd operator configuration. Model IDs are opaque and nested under the
+# harness that offers them.
+name = "local"
+clone_enabled = false
+# Required when --listen binds beyond loopback. Every TCP request (including
+# SSE) must then send Authorization: Bearer TOKEN. Unix sockets stay exempt.
+# Empty is allowed only for a loopback listener and logs a development warning.
+api_bearer_tokens = []
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "" # Set to an environment variable name to enable auth.
+
+[harnesses.fake]
+models = []
+
+[harnesses.pi]
+models = ["openai/gpt-5.6"]
+
+[harnesses.claude]
+models = ["anthropic/claude-sonnet-4"]
+
+# Project paths must be absolute existing directories. Dispatch selects these
+# by name and uses a durable worktree name as its resume key.
+[projects.scratch]
+path = "/tmp"
+description = "Local scratch space"
+
+# Optional restricted SSH terminal attach endpoint. Port 0 (or an absent
+# section) disables it. The host key is generated once if absent; authorized
+# client keys use standard OpenSSH authorized_keys format.
+[attach_ssh]
+port = 0
+host_key_path = "/tmp/golemd-attach-host-key"
+authorized_keys_path = "/tmp/golemd-authorized-keys"

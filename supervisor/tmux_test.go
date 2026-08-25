@@ -28,6 +28,30 @@ func TestGeneratedTmuxThemeIsComposed(t *testing.T) {
 	}
 }
 
+func TestAttachPolicyRemovesTmuxControlBindings(t *testing.T) {
+	dir := t.TempDir()
+	tm := Tmux{Socket: filepath.Join(dir, "tmux.sock")}
+	if err := tm.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	config, err := os.ReadFile(tm.config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := string(config)
+	for _, required := range []string{
+		"unbind-key -a -T prefix",
+		"bind-key -T prefix C-b send-prefix",
+		"bind-key -T prefix d detach-client",
+		"unbind-key -T root MouseDown3Pane",
+		"unbind-key -T root MouseDown1Status",
+	} {
+		if !strings.Contains(policy, required) {
+			t.Fatalf("attach restriction missing %q", required)
+		}
+	}
+}
+
 func TestMissingThemeIsNonBlocking(t *testing.T) {
 	dir := t.TempDir()
 	// A theme artifact that does not exist (or is a symlink) must be skipped so

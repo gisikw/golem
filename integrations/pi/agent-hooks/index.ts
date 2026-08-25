@@ -46,10 +46,14 @@ export default function (pi: ExtensionAPI) {
   };
 
   // Stash the last agent_end payload so agent_settled (which carries no data)
-  // can emit the final assistant message + usage.
+  // can emit the final assistant message + usage. A deliberate agents_block
+  // ends an agent run too, but is not job completion; suppress that settlement
+  // until the operator answer starts the next run.
   let lastFinal: AssistantLike | undefined;
+  let awaitingAnswer = false;
 
   pi.on("agent_start", async () => {
+    awaitingAnswer = false;
     emit({ type: "running", ts: Date.now() });
   });
 
@@ -64,8 +68,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async () => {
-    emit(settledEvent(lastFinal, Date.now(), "done"));
-    lastFinal = undefined;
+    if (!awaitingAnswer) {
+      emit(settledEvent(lastFinal, Date.now(), "done"));
+      lastFinal = undefined;
+    }
   });
 
   // Monotonic question id: distinguishes successive blocks within one worker so
@@ -89,6 +95,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, p: { question: string; options?: string[] }) {
       const id = `${blockSeq++}-${Date.now()}`;
+      awaitingAnswer = true;
       emit(blockedEvent(p.question, p.options, Date.now(), id));
       return { content: [{ type: "text" as const, text: blockedResultText() }] };
     },

@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/gisikw/golem/artifacts"
 	"github.com/gisikw/golem/client"
 	"github.com/gisikw/golem/harnesses"
 	"github.com/gisikw/golem/harnesses/claude"
@@ -66,10 +68,9 @@ type Supervisor struct {
 	StartBackoff     time.Duration
 	Linger           time.Duration
 	Adapters         map[string]harnesses.Adapter
-	// Notify, when non-nil, is invoked after a durable settlement to promptly
-	// wake the Golem operator. It must never block or fail the settlement.
-	Notify Notifier
-	Logger *slog.Logger
+	AttachHost       string
+	AttachPort       int
+	Logger           *slog.Logger
 }
 
 func (s *Supervisor) log() *slog.Logger {
@@ -90,7 +91,7 @@ func DefaultAdapters(piBinary string, claudeArgv, codexArgv []string) map[string
 }
 
 func ConfiguredAdapters(pi piadapter.Adapter, claudeArgv, codexArgv []string) map[string]harnesses.Adapter {
-	return map[string]harnesses.Adapter{"pi": pi, "claude": claude.Adapter{ArgvTemplate: claudeArgv}, "codex": codex.Adapter{ArgvTemplate: codexArgv}, "fake": claude.Adapter{ArgvTemplate: []string{"sh", "-c", "printf '%s\\n' fake-worker-complete; sleep 1"}}}
+	return map[string]harnesses.Adapter{"pi": pi, "claude": claude.Adapter{ArgvTemplate: claudeArgv}, "codex": codex.Adapter{ArgvTemplate: codexArgv}, "fake": claude.Adapter{ArgvTemplate: []string{"sh", "-c", "printf '%s\\n' fake-worker-complete; printf '%s\\n' fake-artifact >\"$GOLEM_ARTIFACT_DIR/result.txt\"; sleep 1"}}}
 }
 
 // Recover adopts surviving sessions. Only pi (currently the only resumable
@@ -135,7 +136,7 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 	for id, w := range s.Registry.Snapshot() {
 		known[id] = w.LastState
 	}
-	poll, err := s.Client.Poll(ctx, s.Host, known)
+	poll, err := s.Client.Poll(ctx, known)
 	if err != nil {
 		return err
 	} // existing workers are untouched
@@ -176,22 +177,47 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 			s.forget(ctx, a.JobID)
 		}
 	}
-	// Deliver answered blocked questions after assignment reconciliation.
+	// Deliver queued interaction input after assignment reconciliation. Answers
+	// retain adapter semantics; steers use the same runtime SendText callback, so
+	// both paths converge on one tmux bracketed-paste-plus-Enter implementation.
 	for _, d := range poll.Assignments {
 		w, ok := s.Registry.Snapshot()[d.Job.ID]
-		if !ok || d.Job.Question == nil || d.Job.Question.Answer == nil || w.AnsweredKey == d.Job.Question.Answer.IdempotencyKey {
+		if !ok {
 			continue
 		}
-		adapter, e := s.adapter(w.Job.Harness)
-		if e != nil {
+		answerPending := d.Job.Question != nil && d.Job.Question.Answer != nil && w.AnsweredKey != d.Job.Question.Answer.IdempotencyKey
+		if answerPending {
+			adapter, e := s.adapter(w.Job.Harness)
+			if e == nil {
+				runtime := s.runtime(w)
+				if e = adapter.Answer(ctx, &runtime, *d.Job.Question.Answer); e == nil {
+					w.AnsweredKey = d.Job.Question.Answer.IdempotencyKey
+					answerPending = false
+					_ = s.Registry.Put(w)
+				} else if !errors.Is(e, harnesses.ErrUnsupported) {
+					s.log().Warn("answer delivery failed", "job", w.Job.ID, "error", e)
+				}
+			}
+		}
+		if answerPending {
 			continue
 		}
-		runtime := s.runtime(w)
-		if e = adapter.Answer(ctx, &runtime, *d.Job.Question.Answer); e == nil {
-			w.AnsweredKey = d.Job.Question.Answer.IdempotencyKey
+		start := 0
+		if w.SteeredKey != "" {
+			for i := range d.Job.Steers {
+				if d.Job.Steers[i].ID == w.SteeredKey {
+					start = i + 1
+					break
+				}
+			}
+		}
+		for _, steer := range d.Job.Steers[start:] {
+			if e := s.sendText(ctx, w, steer.Text); e != nil {
+				s.log().Warn("steer delivery failed", "job", w.Job.ID, "steer", steer.ID, "error", e)
+				break
+			}
+			w.SteeredKey = steer.ID
 			_ = s.Registry.Put(w)
-		} else if !errors.Is(e, harnesses.ErrUnsupported) {
-			s.log().Warn("answer delivery failed", "job", w.Job.ID, "error", e)
 		}
 	}
 	return s.observe(ctx)
@@ -247,7 +273,7 @@ func (s *Supervisor) reconcileStart(ctx context.Context, j protocol.Job) error {
 }
 
 func (s *Supervisor) publishStartFailure(ctx context.Context, j protocol.Job, attempt StartAttempt) error {
-	set := protocol.Settlement{ID: j.ID + "-start-failed", JobID: j.ID, Verdict: protocol.Failed, Summary: fmt.Sprintf("worker failed to start after %d attempt(s): %s", attempt.Count, attempt.Reason), At: time.Now().UTC()}
+	set := protocol.Settlement{ID: j.ID + "-start-failed", JobID: j.ID, State: protocol.Failed, Verdict: protocol.Failed, Summary: fmt.Sprintf("worker failed to start after %d attempt(s): %s", attempt.Count, attempt.Reason), At: time.Now().UTC()}
 	detail, _ := json.Marshal(map[string]any{"failure_boundary": "worker_start", "attempts": attempt.Count, "reason": attempt.Reason})
 	set.Detail = detail
 	event := protocol.ObservedEvent{ID: j.ID + "-start-failed-event", JobID: j.ID, Settlement: &set, ObservedAt: time.Now().UTC()}
@@ -282,23 +308,19 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 	if err = os.MkdirAll(j.Artifacts.Directory, 0o700); err != nil {
 		return err
 	}
-	worktree := ""
-	if j.Isolation == protocol.IsolationWorktree {
-		worktree = filepath.Join(j.Artifacts.Directory, "worktree")
-		if out, worktreeErr := exec.CommandContext(ctx, "git", "-C", j.CWD, "worktree", "add", "--detach", worktree, "HEAD").CombinedOutput(); worktreeErr != nil {
-			return fmt.Errorf("git worktree: %s: %w", out, worktreeErr)
-		}
-		j.CWD = worktree
-	}
 	launch, err := a.Start(ctx, j)
 	if err != nil {
 		return err
 	}
+	if launch.Env == nil {
+		launch.Env = map[string]string{}
+	}
+	launch.Env["GOLEM_ARTIFACT_DIR"] = j.Artifacts.Directory
 	session, target, err := s.Tmux.Start(ctx, j.ID, launch)
 	if err != nil {
 		return err
 	}
-	w := Worker{Job: j, Launch: launch, Session: session, Target: target, Worktree: worktree, RestartUntil: time.Now().Add(s.OfflineWindow), LastState: protocol.Starting, StartedAt: time.Now().UTC()}
+	w := Worker{Job: j, Launch: launch, Session: session, Target: target, RestartUntil: time.Now().Add(s.OfflineWindow), LastState: protocol.Starting, StartedAt: time.Now().UTC()}
 	if err = s.Registry.Put(w); err != nil {
 		return err
 	}
@@ -313,6 +335,13 @@ func (s *Supervisor) publishState(ctx context.Context, w *Worker, state protocol
 	event := protocol.ObservedEvent{ID: w.Job.ID + "-" + string(state), JobID: w.Job.ID, State: state, ObservedAt: time.Now().UTC()}
 	if state == protocol.Starting || state == protocol.Running {
 		event.Terminal = &protocol.TerminalEndpoint{Host: s.Host, Socket: s.Tmux.Socket, Target: w.Target}
+		if s.AttachPort > 0 {
+			host := s.AttachHost
+			if host == "" {
+				host = s.Host
+			}
+			event.Activation = &protocol.Activation{Type: "ssh", Host: host, Port: s.AttachPort, User: w.Job.ID}
+		}
 	}
 	if err := s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
 		return err
@@ -349,13 +378,25 @@ func (s *Supervisor) reassertTerminal(ctx context.Context, job protocol.Job) {
 		return
 	}
 	want := protocol.TerminalEndpoint{Host: s.Host, Socket: s.Tmux.Socket, Target: w.Target}
-	if job.Terminal != nil && *job.Terminal == want {
+	var activation *protocol.Activation
+	if s.AttachPort > 0 {
+		host := s.AttachHost
+		if host == "" {
+			host = s.Host
+		}
+		activation = &protocol.Activation{Type: "ssh", Host: host, Port: s.AttachPort, User: job.ID}
+	}
+	if job.Terminal != nil && *job.Terminal == want && (activation == nil || job.Activation != nil && *job.Activation == *activation) {
 		return
 	}
 	if !s.Tmux.Has(ctx, w.Session) {
 		return // no live terminal exists; never fabricate a target
 	}
-	event := protocol.ObservedEvent{ID: job.ID + "-terminal", JobID: job.ID, Terminal: &want, ObservedAt: time.Now().UTC()}
+	eventID := job.ID + "-terminal"
+	if activation != nil {
+		eventID += fmt.Sprintf("-ssh-%d", activation.Port)
+	}
+	event := protocol.ObservedEvent{ID: eventID, JobID: job.ID, Terminal: &want, Activation: activation, ObservedAt: time.Now().UTC()}
 	if err := s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
 		s.log().Warn("terminal endpoint reassertion deferred", "job", job.ID, "error", err)
 	}
@@ -371,8 +412,12 @@ func (s *Supervisor) publishBlocked(ctx context.Context, w *Worker, q *protocol.
 	w.LastState = protocol.Blocked
 	return s.Registry.Put(*w)
 }
+func (s *Supervisor) sendText(ctx context.Context, w Worker, text string) error {
+	return s.Tmux.Send(ctx, w.Target, text)
+}
+
 func (s *Supervisor) runtime(w Worker) harnesses.Runtime {
-	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.Tmux.Send(ctx, w.Target, text) }, Cancel: func(ctx context.Context) error { return s.Tmux.Kill(ctx, w.Session) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Tmux.Pane(ctx, w.Target) }}
+	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }, Cancel: func(ctx context.Context) error { return s.Tmux.Kill(ctx, w.Session) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Tmux.Pane(ctx, w.Target) }}
 }
 func (s *Supervisor) reapExpired(ctx context.Context, now time.Time) {
 	linger := s.Linger
@@ -401,9 +446,9 @@ func (s *Supervisor) cancel(ctx context.Context, id string) {
 	// Ctrl-C lets the worker pane become a retained dead pane under the owned
 	// tmux policy, preserving its output for the linger window.
 	_ = s.Tmux.Interrupt(ctx, w.Target)
-	set := protocol.Settlement{ID: id + "-cancelled", JobID: id, Verdict: protocol.Cancelled, Summary: "cancelled by requested state", At: time.Now().UTC()}
+	set := protocol.Settlement{ID: id + "-cancelled", JobID: id, State: protocol.Cancelled, Verdict: protocol.Cancelled, Summary: "cancelled by requested state", At: time.Now().UTC()}
 	if err := s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{{ID: id + "-cancel-settlement", JobID: id, Settlement: &set}}}); err == nil {
-		s.settleWorker(w, set.At, set.Verdict)
+		s.settleWorker(w, set.At, set.State)
 	}
 }
 func (s *Supervisor) forget(ctx context.Context, id string) {
@@ -497,16 +542,45 @@ func (s *Supervisor) observe(ctx context.Context) error {
 		if len(obs.Detail) > 0 {
 			settlement.Detail = obs.Detail
 		}
+		s.enrichSettlement(w.Job, settlement, obs)
 		event := protocol.ObservedEvent{ID: id + "-settlement", JobID: id, Settlement: settlement, ObservedAt: time.Now().UTC()}
 		if err = s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
 			return err
 		}
-		s.settleWorker(w, settlement.At, settlement.Verdict)
-		// Settlement is durable; notification is a best-effort courtesy that must
-		// never fail or delay the settlement itself.
-		s.notifySettlement(ctx, w.Job, settlement)
+		s.settleWorker(w, settlement.At, settlement.State)
 	}
 	return nil
+}
+
+// enrichSettlement adds daemon-observable facts without asking an adapter to
+// claim semantics it does not have. Artifact paths are relative, bounded, and
+// deterministic; worktree state is sampled at settlement time.
+func (s *Supervisor) enrichSettlement(job protocol.Job, set *protocol.Settlement, obs harnesses.Observation) {
+	if set.State == "" {
+		set.State = set.Verdict
+	}
+	if verdict := []rune(set.Summary); len(verdict) > 4096 {
+		set.Summary = string(verdict[:4096])
+	}
+	if set.Verdict == "" {
+		set.Verdict = set.State
+	}
+	if set.ExitStatus == nil {
+		set.ExitStatus = obs.ExitCode
+	}
+	listing := artifacts.List(job.Artifacts.Directory)
+	set.Artifacts = listing.Artifacts
+	set.ArtifactsTruncated = listing.ArtifactsTruncated
+	if job.Workspace != nil {
+		wt := &protocol.WorktreeSettlement{Name: job.Workspace.Worktree}
+		if out, err := exec.Command("git", "-C", job.CWD, "rev-parse", "--short", "HEAD").Output(); err == nil {
+			wt.Head = strings.TrimSpace(string(out))
+		}
+		if out, err := exec.Command("git", "-C", job.CWD, "status", "--porcelain").Output(); err == nil {
+			wt.Dirty = len(out) > 0
+		}
+		set.Worktree = wt
+	}
 }
 
 func withinAny(path string, roots []string) bool {

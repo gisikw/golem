@@ -77,7 +77,7 @@ func BasicSettlement(job protocol.Job, launch Launch, o Observation) (*protocol.
 	if o.State == protocol.Timeout {
 		verdict, summary = protocol.Timeout, "harness process timed out"
 	}
-	return &protocol.Settlement{ID: job.ID + "-settlement", JobID: job.ID, Verdict: verdict, Summary: summary, At: time.Now().UTC(), Artifacts: existingArtifacts(launch)}, nil
+	return &protocol.Settlement{ID: job.ID + "-settlement", JobID: job.ID, State: verdict, Verdict: verdict, Summary: summary, ExitStatus: o.ExitCode, At: time.Now().UTC(), Artifacts: existingArtifacts(launch)}, nil
 }
 
 // SideChannelSettlement builds a settlement from a harness hook adapter's
@@ -89,7 +89,7 @@ func SideChannelSettlement(job protocol.Job, launch Launch, o Observation) *prot
 	if !verdict.Terminal() {
 		verdict = protocol.Done
 	}
-	s := &protocol.Settlement{ID: job.ID + "-settlement", JobID: job.ID, Verdict: verdict, Summary: o.Summary, At: time.Now().UTC(), Artifacts: existingArtifacts(launch)}
+	s := &protocol.Settlement{ID: job.ID + "-settlement", JobID: job.ID, State: verdict, Verdict: verdict, Summary: o.Summary, ExitStatus: o.ExitCode, At: time.Now().UTC(), Artifacts: existingArtifacts(launch)}
 	if o.Usage != nil {
 		s.Usage = *o.Usage
 	}

@@ -2,10 +2,8 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"github.com/gisikw/golem/protocol"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -18,37 +16,6 @@ func create(t *testing.T, s *Store) protocol.Job {
 	}
 	return j
 }
-func TestCreateRejectsPlaintextProviderSecret(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	secret := "fixture-api-key"
-	_, err = s.Create(context.Background(), protocol.CreateJob{
-		IdempotencyKey: "secret-key", Harness: "fake", Host: "host", Prompt: "go", CWD: "/tmp",
-		ProviderConfig: &protocol.ProviderConfig{Provider: "demo", ModelsJSON: json.RawMessage(`{"providers":{"demo":{"apiKey":"` + secret + `"}}}`)},
-	})
-	if err == nil || strings.Contains(err.Error(), secret) {
-		t.Fatalf("plaintext provider secret was accepted or echoed: %v", err)
-	}
-}
-
-func TestCreateAcceptsProviderSecretReference(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	_, err = s.Create(context.Background(), protocol.CreateJob{
-		IdempotencyKey: "reference-key", Harness: "fake", Host: "host", Prompt: "go", CWD: "/tmp",
-		ProviderConfig: &protocol.ProviderConfig{Provider: "demo", ModelsJSON: json.RawMessage(`{"providers":{"demo":{"apiKey":"$GOLEM_API_KEY"}}}`)},
-	})
-	if err != nil {
-		t.Fatalf("reference rejected: %v", err)
-	}
-}
-
 func TestSettlementIdempotentAndDurable(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "db")
 	s, e := Open(p)
@@ -86,6 +53,35 @@ func TestSettlementIdempotentAndDurable(t *testing.T) {
 		t.Fatalf("reopen/first settlement: %#v %v", got, e)
 	}
 }
+func TestActivationPublishedAndClearedOnSettlement(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	j := create(t, s)
+	activation := &protocol.Activation{Type: "ssh", Host: "daemon.example", Port: 9922, User: j.ID}
+	if err = s.Record(ctx, protocol.EventBatch{Host: "host", Events: []protocol.ObservedEvent{{ID: "activation-start", JobID: j.ID, State: protocol.Starting, Activation: activation}}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx, j.ID)
+	if err != nil || got.Activation == nil || *got.Activation != *activation {
+		t.Fatalf("activation=%#v err=%v", got.Activation, err)
+	}
+	if err = s.Record(ctx, protocol.EventBatch{Host: "host", Events: []protocol.ObservedEvent{{ID: "activation-run", JobID: j.ID, State: protocol.Running}}}); err != nil {
+		t.Fatal(err)
+	}
+	set := &protocol.Settlement{ID: "activation-settle", JobID: j.ID, State: protocol.Done, At: time.Now()}
+	if err = s.Record(ctx, protocol.EventBatch{Host: "host", Events: []protocol.ObservedEvent{{ID: "activation-terminal", JobID: j.ID, Settlement: set}}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.Get(ctx, j.ID)
+	if err != nil || got.Activation != nil {
+		t.Fatalf("settled activation=%#v err=%v", got.Activation, err)
+	}
+}
+
 func TestAnswerIdempotencyConflict(t *testing.T) {
 	s, e := Open(filepath.Join(t.TempDir(), "db"))
 	if e != nil {
@@ -154,9 +150,31 @@ func TestReapRefusesRunningAndPollsSettledRequest(t *testing.T) {
 	if e != nil || !got.ReapRequested {
 		t.Fatalf("settled reap request: %#v %v", got, e)
 	}
-	poll, e := s.Poll(ctx, "host")
+	poll, e := s.Poll(ctx)
 	if e != nil || len(poll.Assignments) != 1 || !poll.Assignments[0].Job.ReapRequested {
 		t.Fatalf("reap request not delivered to supervisor: %#v %v", poll, e)
+	}
+}
+
+func TestPollOwnsAllJobsRegardlessOfLegacyHostMetadata(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	for _, host := range []string{"old-host-a", "old-host-b"} {
+		if _, err = s.Create(ctx, protocol.CreateJob{IdempotencyKey: host, Harness: "fake", Host: host, Prompt: "go", CWD: "/tmp"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	poll, err := s.Poll(ctx)
+	if err != nil || len(poll.Assignments) != 2 {
+		t.Fatalf("local poll filtered legacy host metadata: %#v %v", poll, err)
+	}
+	job := poll.Assignments[0].Job
+	if err = s.Record(ctx, protocol.EventBatch{Host: "different-name", Events: []protocol.ObservedEvent{{ID: "local-start", JobID: job.ID, State: protocol.Starting}}}); err != nil {
+		t.Fatalf("event was incorrectly host-routed: %v", err)
 	}
 }
 
