@@ -42,6 +42,7 @@ func TestAttachPolicyRemovesTmuxControlBindings(t *testing.T) {
 	for _, required := range []string{
 		"unbind-key -a -T prefix",
 		"bind-key -T prefix C-b send-prefix",
+		"bind-key -T prefix d detach-client",
 		"unbind-key -T root MouseDown3Pane",
 		"unbind-key -T root MouseDown1Status",
 	} {

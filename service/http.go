@@ -201,9 +201,10 @@ func (a API) answer(w http.ResponseWriter, r *http.Request) {
 	output(w, 200, j)
 }
 func (a API) steer(w http.ResponseWriter, r *http.Request) {
-	var x struct {
-		Text string `json:"text"`
-	}
+	// Decode the full protocol type (mirroring answer): clients marshal
+	// protocol.Steer, whose zero At field is always present because omitempty
+	// never omits struct values. Server-assigned fields are ignored.
+	var x protocol.Steer
 	if err := decode(w, r, &x); err != nil {
 		failure(w, err, http.StatusBadRequest)
 		return
