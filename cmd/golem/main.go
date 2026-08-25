@@ -48,7 +48,7 @@ func main() {
 	root.Parse(os.Args[1:])
 	args := root.Args()
 	if len(args) == 0 {
-		fatal(fmt.Errorf("usage: golem [--service URL] [--token TOKEN] [--json] {dispatch|capabilities|status|list|await|events|artifacts|attach|attach-hint|cancel|reap|answer|gc}"))
+		fatal(fmt.Errorf("usage: golem [--service URL] [--token TOKEN] [--json] {dispatch|capabilities|status|list|await|events|artifacts|attach|attach-hint|cancel|reap|answer|steer|gc}"))
 	}
 	ctx := context.Background()
 	c := client.NewWithToken(*endpoint, *token)
@@ -260,6 +260,13 @@ func main() {
 			qid = j.Question.ID
 		}
 		j, e = c.Answer(ctx, args[1], protocol.Answer{IdempotencyKey: fmt.Sprintf("cli-%d", time.Now().UnixNano()), QuestionID: qid, Text: strings.Join(args[2:], " ")})
+		if e != nil {
+			fatal(e)
+		}
+		print(j)
+	case "steer":
+		need(args, 3)
+		j, e := c.Steer(ctx, args[1], protocol.Steer{Text: strings.Join(args[2:], " ")})
 		if e != nil {
 			fatal(e)
 		}

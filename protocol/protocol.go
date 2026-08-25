@@ -168,6 +168,7 @@ type Job struct {
 	CancelRequested bool               `json:"cancel_requested,omitempty"`
 	ReapRequested   bool               `json:"reap_requested,omitempty"`
 	Question        *BlockedQuestion   `json:"question,omitempty"`
+	Steers          []Steer            `json:"steers,omitempty"`
 	LastProgress    *Progress          `json:"last_progress,omitempty"`
 	Settlement      *Settlement        `json:"settlement,omitempty"`
 	Terminal        *TerminalEndpoint  `json:"terminal,omitempty"`
@@ -219,6 +220,14 @@ type Answer struct {
 	Text           string          `json:"text"`
 	At             time.Time       `json:"at,omitempty"`
 	Detail         json.RawMessage `json:"detail,omitempty"`
+}
+
+// Steer is operator input queued for delivery to a live worker. ID and At are
+// assigned by the service; clients only need to provide Text.
+type Steer struct {
+	ID   string    `json:"id,omitempty"`
+	Text string    `json:"text"`
+	At   time.Time `json:"at,omitempty"`
 }
 
 type Usage struct {

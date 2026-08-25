@@ -12,7 +12,7 @@ This document records the extracted system's intentional boundaries. It is not a
 8. **Start failures are bounded and durable.** Transient pre-registration failures use persisted attempts and backoff; permanent configuration or authorization failures settle immediately.
 9. **Interactive harnesses use lifecycle side channels.** A TUI owns its pane without a tee wrapper. Hook adapters append durable JSONL events and observation advances a persisted byte cursor. Process death remains the crash boundary.
 10. **Minimal argv harnesses remain minimal.** Claude and Codex wrappers provide argv templating, transcript, and exit status only; they do not claim resume, usage, native blocking, or steering semantics.
-11. **Steering uses tmux keystrokes.** Multi-line input uses bracketed paste followed by Enter. Cancellation remains process-level.
+11. **Steering uses tmux keystrokes.** Multi-line input uses bracketed paste followed by Enter. Steering is also an API interaction surface delivered through the same reconciler keystroke machinery as answers. Cancellation remains process-level.
 12. **Blocked questions are explicit adapter actions.** The pi hook registers `agents_block`; an answer is delivered as the next TUI message. This avoids guessing from rendered terminal output.
 13. **SUPERSEDED: settlement callbacks are best-effort.** The webhook and atomic worklist drop-box notification path was removed in Phase 3. Durable resumable events (decision 20) are now the only prompt notification mechanism; job polling remains the fallback.
 14. **Worker tmux policy is private and complete.** It is supplied at server birth and re-applied after starts and supervisor restarts. Worker panes retain exit status; unrelated human-opened panes do not remain after exit.

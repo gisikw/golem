@@ -68,7 +68,7 @@ Provider descriptors and credentials are not accepted over the wire. For pi, `<p
 - `dispatch` (`--project` or `--repo`, plus a named `--worktree`; low-level `--cwd`)
 - `status`, `list [--state]`, and `await`
 - `artifacts JOB-ID` and `artifacts JOB-ID PATH [-o FILE]`
-- `attach` (local tmux fast path, otherwise SSH), `attach-hint`, `answer`, `cancel`, and `reap`
+- `attach` (local tmux fast path, otherwise SSH), `attach-hint`, `answer`, `steer`, `cancel`, and `reap`
 - `gc --root DIR --older-than DURATION`
 
 Use global `--json` for machine-readable output. `--service` accepts `unix:///path` or an HTTP URL. For TCP, pass `--token TOKEN` or set `GOLEM_TOKEN`.
@@ -103,7 +103,7 @@ The listener exposes:
 - `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`
 - `GET /v1/jobs/{id}/artifacts` and `GET /v1/jobs/{id}/artifacts/{path...}`
 - `GET /v1/events?since=SEQ[&job=ID]` (durable replay + live SSE)
-- `POST /v1/jobs/{id}/{cancel,reap,answer}`
+- `POST /v1/jobs/{id}/{cancel,reap,answer,steer}`
 - internal local reconciliation via `POST /v1/jobs/poll` and `POST /v1/events`
 - `GET /live`, `GET /ready`
 
