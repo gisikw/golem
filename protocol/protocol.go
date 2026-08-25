@@ -214,26 +214,97 @@ type Answer struct {
 }
 
 type Usage struct {
-	InputTokens  int64 `json:"input_tokens,omitempty"`
-	OutputTokens int64 `json:"output_tokens,omitempty"`
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
 	CostMicros   int64 `json:"cost_micros,omitempty"`
 }
 
 type ArtifactRef struct {
-	Name   string `json:"name"`
+	Name   string `json:"-"` // legacy adapter label; Path is the wire identity
 	Path   string `json:"path"`
-	Digest string `json:"digest,omitempty"`
+	Size   int64  `json:"size"`
+	Digest string `json:"-"`
+}
+
+type WorktreeSettlement struct {
+	Name  string `json:"name"`
+	Head  string `json:"head,omitempty"`
+	Dirty bool   `json:"dirty"`
 }
 
 type Settlement struct {
-	ID        string          `json:"id"`
-	JobID     string          `json:"job_id"`
-	Verdict   State           `json:"verdict"`
-	Summary   string          `json:"summary,omitempty"`
-	Usage     Usage           `json:"usage,omitempty"`
-	Artifacts []ArtifactRef   `json:"artifacts,omitempty"`
-	Detail    json.RawMessage `json:"detail,omitempty"`
-	At        time.Time       `json:"at"`
+	ID    string `json:"id,omitempty"`
+	JobID string `json:"job_id,omitempty"`
+	State State  `json:"state"`
+	// Verdict and Summary retain the pre-Phase-3 Go names. State and Summary
+	// are the public settlement state and bounded harness verdict respectively.
+	Verdict            State               `json:"-"`
+	Summary            string              `json:"verdict,omitempty"`
+	ExitStatus         *int                `json:"exit_status,omitempty"`
+	Usage              Usage               `json:"usage"`
+	Artifacts          []ArtifactRef       `json:"artifacts,omitempty"`
+	ArtifactsTruncated bool                `json:"artifacts_truncated,omitempty"`
+	Worktree           *WorktreeSettlement `json:"worktree,omitempty"`
+	Detail             json.RawMessage     `json:"detail,omitempty"`
+	At                 time.Time           `json:"at"`
+}
+
+func (s Settlement) MarshalJSON() ([]byte, error) {
+	state := s.State
+	if state == "" && s.Verdict.Terminal() {
+		state = s.Verdict
+	}
+	verdict := s.Summary
+	if verdict == "" && s.Verdict != "" && s.Verdict != state {
+		verdict = string(s.Verdict)
+	}
+	type wire struct {
+		ID                 string              `json:"id,omitempty"`
+		JobID              string              `json:"job_id,omitempty"`
+		State              State               `json:"state"`
+		Verdict            string              `json:"verdict,omitempty"`
+		ExitStatus         *int                `json:"exit_status,omitempty"`
+		Usage              Usage               `json:"usage"`
+		Artifacts          []ArtifactRef       `json:"artifacts,omitempty"`
+		ArtifactsTruncated bool                `json:"artifacts_truncated,omitempty"`
+		Worktree           *WorktreeSettlement `json:"worktree,omitempty"`
+		Detail             json.RawMessage     `json:"detail,omitempty"`
+		At                 time.Time           `json:"at"`
+	}
+	return json.Marshal(wire{s.ID, s.JobID, state, verdict, s.ExitStatus, s.Usage, s.Artifacts, s.ArtifactsTruncated, s.Worktree, s.Detail, s.At})
+}
+
+func (s *Settlement) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		ID                 string              `json:"id"`
+		JobID              string              `json:"job_id"`
+		State              State               `json:"state"`
+		Verdict            string              `json:"verdict"`
+		ExitStatus         *int                `json:"exit_status"`
+		Usage              Usage               `json:"usage"`
+		Artifacts          []ArtifactRef       `json:"artifacts"`
+		ArtifactsTruncated bool                `json:"artifacts_truncated"`
+		Worktree           *WorktreeSettlement `json:"worktree"`
+		Detail             json.RawMessage     `json:"detail"`
+		At                 time.Time           `json:"at"`
+	}
+	var w wire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	*s = Settlement{ID: w.ID, JobID: w.JobID, State: w.State, Verdict: w.State, Summary: w.Verdict, ExitStatus: w.ExitStatus, Usage: w.Usage, Artifacts: w.Artifacts, ArtifactsTruncated: w.ArtifactsTruncated, Worktree: w.Worktree, Detail: w.Detail, At: w.At}
+	return nil
+}
+
+type Event struct {
+	Seq        int64            `json:"seq"`
+	Kind       string           `json:"kind"`
+	JobID      string           `json:"job_id"`
+	State      State            `json:"state,omitempty"`
+	Question   *BlockedQuestion `json:"question,omitempty"`
+	Progress   *Progress        `json:"progress,omitempty"`
+	Settlement *Settlement      `json:"settlement,omitempty"`
+	At         time.Time        `json:"at"`
 }
 
 type ObservedEvent struct {

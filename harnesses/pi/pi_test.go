@@ -159,6 +159,34 @@ func TestConfiguredProviderProfile(t *testing.T) {
 	}
 }
 
+func TestBuiltInHookIsMaterializedByDefault(t *testing.T) {
+	dir := t.TempDir()
+	j := protocol.Job{ID: "j", Prompt: "go", CWD: dir, Artifacts: protocol.ArtifactMetadata{Directory: dir}}
+	launch, err := (Adapter{Binary: "pi"}).Start(context.Background(), j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := os.ReadFile(filepath.Join(dir, "pi", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Extensions []string `json:"extensions"`
+	}
+	if err = json.Unmarshal(settings, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Extensions) != 1 || !strings.HasSuffix(got.Extensions[0], "golem-agent-hooks/index.ts") {
+		t.Fatalf("built-in hook missing: %#v", got.Extensions)
+	}
+	if _, err = os.Stat(got.Extensions[0]); err != nil {
+		t.Fatal(err)
+	}
+	if launch.Events == "" || launch.Env[EventsEnv] != launch.Events {
+		t.Fatalf("side-channel not provisioned: %#v", launch)
+	}
+}
+
 func TestObserveProjectsSideChannelWithCursor(t *testing.T) {
 	dir := t.TempDir()
 	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Artifacts: protocol.ArtifactMetadata{ID: "j", Directory: dir}}

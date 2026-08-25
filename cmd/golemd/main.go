@@ -55,20 +55,6 @@ func argvEnv(key string, fallback []string) []string {
 	}
 	return out
 }
-func notifiers(name string) supervisor.Notifier {
-	var all supervisor.Notifiers
-	if dir := os.Getenv("GOLEM_WORKLIST_DIR"); dir != "" {
-		all = append(all, supervisor.WorklistNotifier{Host: name, Dir: dir})
-	}
-	if url := os.Getenv("GOLEM_SETTLEMENT_WEBHOOK"); url != "" {
-		all = append(all, supervisor.WebhookNotifier{Host: name, URL: url})
-	}
-	if len(all) == 0 {
-		return nil
-	}
-	return all
-}
-
 func main() {
 	home, _ := os.UserHomeDir()
 	defaultState := filepath.Join(home, ".local", "state", "golem")
@@ -174,7 +160,7 @@ func main() {
 	if *socket == "" {
 		internalEndpoint = "http://" + *listen
 	}
-	sup := &supervisor.Supervisor{Host: cfg.Name, Client: client.New(internalEndpoint), Registry: registry, Tmux: tmux, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters, Notify: notifiers(cfg.Name)}
+	sup := &supervisor.Supervisor{Host: cfg.Name, Client: client.New(internalEndpoint), Registry: registry, Tmux: tmux, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -36,5 +36,7 @@ endpoint="unix://$state/state/golemd.sock"
 job=$("$state/golem" --service "$endpoint" --json dispatch --harness pi --model "$model" --project live --worktree smoke 'Reply with exactly: GOLEM_LIVE_OK')
 id=$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<<"$job")
 "$state/golem" --service "$endpoint" --json await --timeout 5m "$id" | tee "$state/result.json"
-grep -Eq 'GOLEM_LIVE_OK|"last_progress"|"settlement"' "$state/result.json" || { cat "$state/daemon.log"; echo 'worker produced no observable output' >&2; exit 1; }
+grep -q '"state":"done"' "$state/result.json" || { cat "$state/daemon.log"; echo 'worker did not settle done' >&2; exit 1; }
+grep -q '"settlement"' "$state/result.json" || { cat "$state/daemon.log"; echo 'worker settlement missing' >&2; exit 1; }
+grep -q 'GOLEM_LIVE_OK' "$state/result.json" || { cat "$state/daemon.log"; echo 'worker verdict missing expected response' >&2; exit 1; }
 echo 'live pi smoke: PASS'

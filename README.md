@@ -85,6 +85,7 @@ The listener exposes:
 
 - `GET /v1/capabilities`
 - `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`
+- `GET /v1/events?since=SEQ[&job=ID]` (durable replay + live SSE)
 - `POST /v1/jobs/{id}/{cancel,reap,answer}`
 - internal local reconciliation via `POST /v1/jobs/poll` and `POST /v1/events`
 - `GET /live`, `GET /ready`

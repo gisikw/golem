@@ -44,7 +44,7 @@ func main() {
 	root.Parse(os.Args[1:])
 	args := root.Args()
 	if len(args) == 0 {
-		fatal(fmt.Errorf("usage: golem [--service URL] [--json] {dispatch|capabilities|status|list|await|attach-hint|cancel|reap|answer|gc}"))
+		fatal(fmt.Errorf("usage: golem [--service URL] [--json] {dispatch|capabilities|status|list|await|events|attach-hint|cancel|reap|answer|gc}"))
 	}
 	ctx := context.Background()
 	c := client.New(*endpoint)
@@ -114,20 +114,71 @@ func main() {
 		if f.NArg() != 1 {
 			fatal(fmt.Errorf("await requires one job id"))
 		}
-		deadline := time.Now().Add(*timeout)
-		for {
-			j, e := c.Get(ctx, f.Arg(0))
-			if e != nil {
-				fatal(e)
-			}
-			if j.State.Terminal() || j.State == protocol.Blocked {
-				print(j)
-				return
-			}
-			if time.Now().After(deadline) {
+		id := f.Arg(0)
+		j, e := c.Get(ctx, id)
+		if e != nil {
+			fatal(e)
+		}
+		if j.State.Terminal() || j.State == protocol.Blocked {
+			print(j)
+			return
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, *timeout)
+		defer cancel()
+		events, errs := c.StreamEvents(waitCtx, 0, id)
+		for events != nil || errs != nil {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					events = nil
+					continue
+				}
+				if event.Kind == "job.settled" || event.Kind == "job.state" && event.State == protocol.Blocked {
+					j, e = c.Get(ctx, id)
+					if e != nil {
+						fatal(e)
+					}
+					print(j)
+					return
+				}
+			case e, ok := <-errs:
+				if !ok {
+					errs = nil
+					continue
+				}
+				if e != nil {
+					fatal(e)
+				}
+			case <-waitCtx.Done():
 				fatal(fmt.Errorf("await timed out after %s; job was not cancelled", *timeout))
 			}
-			time.Sleep(500 * time.Millisecond)
+		}
+		fatal(errors.New("event stream ended before job settled"))
+	case "events":
+		f := flag.NewFlagSet("events", flag.ExitOnError)
+		since := f.Int64("since", 0, "resume after global sequence")
+		job := f.String("job", "", "filter by job id")
+		f.Parse(args[1:])
+		if *since < 0 {
+			fatal(errors.New("--since must be non-negative"))
+		}
+		stream, errs := c.StreamEvents(ctx, *since, *job)
+		enc := json.NewEncoder(os.Stdout)
+		for stream != nil || errs != nil {
+			select {
+			case event, ok := <-stream:
+				if !ok {
+					stream = nil
+				} else if e := enc.Encode(event); e != nil {
+					fatal(e)
+				}
+			case e, ok := <-errs:
+				if !ok {
+					errs = nil
+				} else if e != nil {
+					fatal(e)
+				}
+			}
 		}
 	case "cancel":
 		need(args, 2)
