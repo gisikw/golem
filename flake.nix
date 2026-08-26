@@ -24,40 +24,26 @@
             wrapProgram $out/bin/golemd --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.bash ]}
           '';
         });
-        familiar-render = (build "golem-familiar-render" [ "./cmd/golem-familiar-render" ]).overrideAttrs (old: {
-          postInstall = (old.postInstall or "") + ''
-            wrapProgram $out/bin/golem-familiar-render --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux ]}
-          '';
-        });
-        # Combined output for deployment: one profile carrying every golem
+        # Combined output for deployment: one profile carrying every Golem
         # binary, so trackers (e.g. fort-nix tracked services) can build a
         # single attr without CLI/daemon version skew.
         full = pkgs.symlinkJoin {
           name = "golem-full";
-          paths = [ cli daemon familiar-render ];
+          paths = [ cli daemon ];
         };
       in {
-        packages = { inherit cli daemon familiar-render full; default = cli; };
+        packages = { inherit cli daemon full; default = cli; };
         apps = {
           default = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
           golem = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
           golemd = { type = "app"; program = "${daemon}/bin/golemd"; };
-          golem-familiar-render = { type = "app"; program = "${familiar-render}/bin/golem-familiar-render"; };
         };
         checks = {
-          inherit cli daemon familiar-render;
+          inherit cli daemon;
           agent-hooks = pkgs.runCommand "golem-agent-hooks-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
             cp -r ${./integrations/pi/agent-hooks} ./agent-hooks
             chmod -R u+w ./agent-hooks
             bun test ./agent-hooks/events.test.ts
-            touch $out
-          '';
-          familiar-extension = pkgs.runCommand "golem-familiar-extension-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
-            mkdir -p ./contrib
-            cp -r ${./contrib/familiar} ./contrib/familiar
-            cp ${./flake.nix} ./flake.nix
-            chmod -R u+w ./contrib/familiar
-            bun test ./contrib/familiar/pi/agents/resolve.test.ts ./contrib/familiar/pi/agents/cli.test.ts ./contrib/familiar/pi/agents/extension.test.ts ./contrib/familiar/manifest.test.ts
             touch $out
           '';
         };
