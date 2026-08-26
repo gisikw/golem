@@ -29,8 +29,15 @@
             wrapProgram $out/bin/golem-familiar-render --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux ]}
           '';
         });
+        # Combined output for deployment: one profile carrying every golem
+        # binary, so trackers (e.g. fort-nix tracked services) can build a
+        # single attr without CLI/daemon version skew.
+        full = pkgs.symlinkJoin {
+          name = "golem-full";
+          paths = [ cli daemon familiar-render ];
+        };
       in {
-        packages = { inherit cli daemon familiar-render; default = cli; };
+        packages = { inherit cli daemon familiar-render full; default = cli; };
         apps = {
           default = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
           golem = { type = "app"; program = "${cli}/bin/golem"; meta.description = "Control Golem delegated agents"; };
