@@ -104,8 +104,23 @@ describe("settledEvent", () => {
     );
     expect(ev).toEqual({ type: "settled", ts: 1000, verdict: "done", summary: "done it", usage: { input: 10, output: 4, cost: 0.002 } });
   });
-  test("omits usage/summary when absent", () => {
+  test("omits usage/summary for an explicit failure when absent", () => {
     expect(settledEvent(undefined, 5, "failed")).toEqual({ type: "settled", ts: 5, verdict: "failed" });
+  });
+  test("fails closed when a nominal success has no terminal explanation", () => {
+    expect(settledEvent(undefined, 6, "done")).toEqual({
+      type: "settled", ts: 6, verdict: "failed",
+      summary: "worker settled without a non-empty final response",
+    });
+    expect(settledEvent(
+      { role: "assistant", content: [], usage: { input: 20, output: 16, cost: { total: 0 } } },
+      7,
+      "done",
+    )).toEqual({
+      type: "settled", ts: 7, verdict: "failed",
+      summary: "worker settled without a non-empty final response",
+      usage: { input: 20, output: 16, cost: 0 },
+    });
   });
 });
 

@@ -141,10 +141,19 @@ export function settledEvent(
   now: number,
   verdict: SettledVerdict = "done",
 ): Extract<SideEvent, { type: "settled" }> {
+  let summary = final ? assistantText(final.content) : "";
+  // A successful worker must leave a non-empty terminal explanation. Pi can
+  // emit agent_settled after an output-limit stop or an operator interrupt;
+  // treating that vacuous lifecycle event as "done" loses the task while
+  // preserving no evidence that anything completed. Explicit non-success
+  // verdicts remain unchanged, but an unexplained success fails closed.
+  if (verdict === "done" && !summary) {
+    verdict = "failed";
+    summary = "worker settled without a non-empty final response";
+  }
   const ev: Extract<SideEvent, { type: "settled" }> = { type: "settled", ts: now, verdict };
+  if (summary) ev.summary = summary;
   if (final) {
-    const summary = assistantText(final.content);
-    if (summary) ev.summary = summary;
     const u = final.usage;
     if (u && (typeof u.input === "number" || typeof u.output === "number")) {
       ev.usage = {
