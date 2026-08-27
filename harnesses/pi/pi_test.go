@@ -44,6 +44,17 @@ func TestStartLaunchesInteractiveTUIWithSideChannel(t *testing.T) {
 	if launch.Events == "" || launch.Env[EventsEnv] != launch.Events {
 		t.Fatalf("side-channel path not wired into env: %#v", launch)
 	}
+	if launch.Env[TaskContextEnv] != filepath.Join(dir, "task.json") {
+		t.Fatalf("task context path not wired into env: %#v", launch.Env)
+	}
+	var task struct {
+		Prompt string `json:"prompt"`
+		CWD    string `json:"cwd"`
+	}
+	b, readErr := os.ReadFile(launch.Env[TaskContextEnv])
+	if readErr != nil || json.Unmarshal(b, &task) != nil || task.Prompt != "p" || task.CWD != dir {
+		t.Fatalf("immutable task context missing dispatch: %s, %v", b, readErr)
+	}
 	// Worker profile isolation: PI_CODING_AGENT_DIR is set explicitly to the
 	// per-job dir so the ambient (operator) profile can never leak in.
 	wantDir := filepath.Join(dir, "pi")
@@ -226,6 +237,25 @@ func TestObserveProjectsSideChannelWithCursor(t *testing.T) {
 	}
 	if o.Usage == nil || o.Usage.InputTokens != 10 || o.Usage.OutputTokens != 4 || o.Usage.CostMicros != 2000 {
 		t.Fatalf("settlement usage not projected: %#v", o.Usage)
+	}
+}
+
+func TestObserveProjectsCompactionExhaustion(t *testing.T) {
+	dir := t.TempDir()
+	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Artifacts: protocol.ArtifactMetadata{ID: "j", Directory: dir}}
+	l, _ := (Adapter{}).Start(context.Background(), j)
+	lines := "{\"type\":\"exhausted\",\"ts\":1,\"count\":4,\"reason\":\"compaction limit reached\"}\n" +
+		"{\"type\":\"settled\",\"ts\":2,\"verdict\":\"done\",\"summary\":\"must not win\"}\n"
+	if err := os.WriteFile(l.Events, []byte(lines), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := &harnesses.Runtime{Launch: l, Alive: func(context.Context) (bool, *int, error) { return true, nil, nil }}
+	o, err := (Adapter{}).Observe(context.Background(), j, r)
+	if err != nil || !o.Settled || !o.Terminate || o.Verdict != protocol.Failed {
+		t.Fatalf("exhaustion not projected as terminal failure: %#v, %v", o, err)
+	}
+	if !strings.Contains(o.Summary, "4 attempts") || o.Summary == "must not win" {
+		t.Fatalf("later ordinary settlement overwrote exhaustion: %#v", o)
 	}
 }
 

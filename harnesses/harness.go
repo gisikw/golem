@@ -46,9 +46,12 @@ type Observation struct {
 	// still alive (an interactive TUI does not exit when a turn completes).
 	// Verdict/Summary/Usage carry the harness-reported settlement content.
 	Settled bool
-	Verdict protocol.State
-	Summary string
-	Usage   *protocol.Usage
+	// Terminate asks the supervisor to kill the harness immediately after its
+	// terminal settlement is durably published (for policy exhaustion).
+	Terminate bool
+	Verdict   protocol.State
+	Summary   string
+	Usage     *protocol.Usage
 }
 
 // Adapter is deliberately explicit even when a minimal harness cannot support

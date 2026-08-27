@@ -75,6 +75,10 @@ type Provider struct {
 // EventsEnv names the side-channel path the hook extension writes to.
 const EventsEnv = "GOLEM_EVENTS"
 
+// TaskContextEnv names the immutable per-job context file used to re-steer a
+// worker after compaction without trusting its lossy conversational memory.
+const TaskContextEnv = "GOLEM_TASK_CONTEXT"
+
 // CodingDirEnv is the pi coding-agent dir. The adapter sets it explicitly per
 // worker so the ambient (operator) value can never take effect.
 const CodingDirEnv = "PI_CODING_AGENT_DIR"
@@ -103,12 +107,13 @@ func paths(j protocol.Job) (string, string, string) {
 		filepath.Join(j.Artifacts.Directory, "events.jsonl")
 }
 
-func (a Adapter) launchEnv(events, workerDir string) map[string]string {
+func (a Adapter) launchEnv(events, workerDir, taskContext string) map[string]string {
 	env := cloneEnv(a.Env)
 	if env == nil {
 		env = map[string]string{}
 	}
 	env[EventsEnv] = events
+	env[TaskContextEnv] = taskContext
 	// Explicit override: this wins over any ambient PI_CODING_AGENT_DIR the
 	// supervisor process inherited from the operator, so the worker never loads
 	// the operator's personal profile.
@@ -121,6 +126,33 @@ func (a Adapter) launchEnv(events, workerDir string) map[string]string {
 // settings raced by concurrent Starts) and removed with the job's artifacts.
 func workerDir(j protocol.Job) string {
 	return filepath.Join(j.Artifacts.Directory, "pi")
+}
+
+func taskContextPath(j protocol.Job) string {
+	return filepath.Join(j.Artifacts.Directory, "task.json")
+}
+
+// writeTaskContext persists the immutable dispatch and resolved workspace for
+// compaction re-steering. It is deliberately separate from the pi session: the
+// fourth-compaction guard must not depend on the memory it is policing.
+func writeTaskContext(j protocol.Job) (string, error) {
+	p := taskContextPath(j)
+	body := struct {
+		ID        string                      `json:"id"`
+		Harness   protocol.HarnessKind        `json:"harness"`
+		Model     string                      `json:"model,omitempty"`
+		CWD       string                      `json:"cwd"`
+		Prompt    string                      `json:"prompt"`
+		Workspace *protocol.ResolvedWorkspace `json:"workspace,omitempty"`
+	}{j.ID, j.Harness, j.Model, j.CWD, j.Prompt, j.Workspace}
+	b, err := json.MarshalIndent(body, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err = os.WriteFile(p, b, 0o600); err != nil {
+		return "", err
+	}
+	return p, nil
 }
 
 // workerExtensions is the exact, auditable worker extension set. The leak-guard
@@ -306,6 +338,10 @@ func (a Adapter) Start(_ context.Context, j protocol.Job) (harnesses.Launch, err
 	}
 	s, t, ev := paths(j)
 	wd := workerDir(j)
+	taskContext, err := writeTaskContext(j)
+	if err != nil {
+		return harnesses.Launch{}, err
+	}
 	if err := a.writeWorkerProfile(wd, j.Model); err != nil {
 		return harnesses.Launch{}, err
 	}
@@ -319,7 +355,7 @@ func (a Adapter) Start(_ context.Context, j protocol.Job) (harnesses.Launch, err
 		v = append(v, "--model", m)
 	}
 	v = append(v, withBlockSuffix(j.Prompt))
-	return harnesses.Launch{Argv: v, Dir: j.CWD, Env: a.launchEnv(ev, wd), Transcript: t, Session: s, Events: ev, Interactive: true}, nil
+	return harnesses.Launch{Argv: v, Dir: j.CWD, Env: a.launchEnv(ev, wd, taskContext), Transcript: t, Session: s, Events: ev, Interactive: true}, nil
 }
 
 func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (harnesses.Launch, error) {
@@ -330,6 +366,10 @@ func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (
 		_, _, l.Events = paths(j)
 	}
 	wd := workerDir(j)
+	taskContext, err := writeTaskContext(j)
+	if err != nil {
+		return harnesses.Launch{}, err
+	}
 	if err := a.writeWorkerProfile(wd, j.Model); err != nil {
 		return harnesses.Launch{}, err
 	}
@@ -338,7 +378,7 @@ func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (
 		l.Argv = append(l.Argv, "--model", m)
 	}
 	l.Argv = append(l.Argv, "Continue the interrupted delegated task from the existing session.")
-	l.Env = a.launchEnv(l.Events, wd)
+	l.Env = a.launchEnv(l.Events, wd, taskContext)
 	l.Interactive = true
 	return l, nil
 }
@@ -385,6 +425,8 @@ type sideEvent struct {
 	ID      string     `json:"id,omitempty"`
 	Prompt  string     `json:"prompt,omitempty"`
 	Options []string   `json:"options,omitempty"`
+	Count   int        `json:"count,omitempty"`
+	Reason  string     `json:"reason,omitempty"`
 	Usage   *sideUsage `json:"usage,omitempty"`
 }
 type sideUsage struct {
@@ -437,14 +479,24 @@ func (Adapter) Observe(ctx context.Context, j protocol.Job, r *harnesses.Runtime
 			}
 			switch ev.Type {
 			case "settled":
-				o.Settled = true
-				o.Verdict = mapVerdict(ev.Verdict)
-				o.Summary = ev.Summary
-				if ev.Usage != nil {
-					o.Usage = &protocol.Usage{InputTokens: ev.Usage.Input, OutputTokens: ev.Usage.Output, CostMicros: int64(math.Round(ev.Usage.Cost * 1_000_000))}
+				// Exhaustion is terminal policy state. A graceful pi shutdown may
+				// append an ordinary settled record afterward; it must not overwrite
+				// the failed verdict or immediate-kill request.
+				if !o.Terminate {
+					o.Settled = true
+					o.Verdict = mapVerdict(ev.Verdict)
+					o.Summary = ev.Summary
+					if ev.Usage != nil {
+						o.Usage = &protocol.Usage{InputTokens: ev.Usage.Input, OutputTokens: ev.Usage.Output, CostMicros: int64(math.Round(ev.Usage.Cost * 1_000_000))}
+					}
 				}
 			case "blocked":
 				o.Question = &protocol.BlockedQuestion{ID: ev.ID, Prompt: ev.Prompt, Options: ev.Options, At: at, Detail: json.RawMessage(append([]byte(nil), b...))}
+			case "exhausted":
+				o.Settled = true
+				o.Terminate = true
+				o.Verdict = protocol.Failed
+				o.Summary = fmt.Sprintf("worker exhausted compaction budget after %d attempts", ev.Count)
 			default:
 				h := sha256.Sum256(b)
 				msg := ev.Message

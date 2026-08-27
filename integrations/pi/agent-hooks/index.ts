@@ -21,7 +21,18 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { appendEvent, blockedEvent, blockedResultText, finalAssistant, settledEvent, type AssistantLike } from "./events.ts";
+import fs from "node:fs";
+import {
+  appendEvent,
+  blockedEvent,
+  blockedResultText,
+  compactionResteer,
+  finalAssistant,
+  nextCompactionCount,
+  settledEvent,
+  type AssistantLike,
+  type TaskContext,
+} from "./events.ts";
 
 export default function (pi: ExtensionAPI) {
   const path = process.env.GOLEM_EVENTS;
@@ -45,12 +56,26 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const task: TaskContext = (() => {
+    const taskPath = process.env.GOLEM_TASK_CONTEXT;
+    if (!taskPath) return {};
+    try {
+      return JSON.parse(fs.readFileSync(taskPath, "utf8")) as TaskContext;
+    } catch (err) {
+      try { process.stderr.write(`[agent-hooks] task context read failed: ${String(err)}\n`); } catch { /* ignore */ }
+      return {};
+    }
+  })();
+
   // Stash the last agent_end payload so agent_settled (which carries no data)
   // can emit the final assistant message + usage. A deliberate agents_block
   // ends an agent run too, but is not job completion; suppress that settlement
-  // until the operator answer starts the next run.
+  // until the operator answer starts the next run. Compaction exhaustion is a
+  // harness failure and likewise suppresses a later ordinary "done" event.
   let lastFinal: AssistantLike | undefined;
   let awaitingAnswer = false;
+  let exhausted = false;
+  let pendingCompactionCount = 0;
 
   pi.on("agent_start", async () => {
     awaitingAnswer = false;
@@ -68,10 +93,49 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async () => {
-    if (!awaitingAnswer) {
+    if (!awaitingAnswer && !exhausted) {
       emit(settledEvent(lastFinal, Date.now(), "done"));
       lastFinal = undefined;
     }
+  });
+
+  // Compaction is bounded job-control state, not unbounded conversational
+  // memory. Three compactions are allowed. Each successful compaction receives
+  // an explicit re-steer containing the verbatim dispatch and live Git state;
+  // the third orders finish-or-block. A fourth attempt fails the job and asks
+  // pi to shut down. The supervisor treats the exhausted side event as an
+  // immediate kill boundary, so graceful shutdown is only a backstop.
+  pi.on("session_before_compact", async (event, ctx) => {
+    const count = nextCompactionCount(event.branchEntries);
+    pendingCompactionCount = count;
+    if (count < 4) return;
+    exhausted = true;
+    emit({ type: "exhausted", ts: Date.now(), count, reason: "compaction limit reached" });
+    ctx.shutdown();
+    return { cancel: true };
+  });
+
+  pi.on("session_compact", async (event) => {
+    const count = pendingCompactionCount || 1;
+    pendingCompactionCount = 0;
+    emit({ type: "compaction", ts: Date.now(), count, reason: event.reason });
+
+    const git = async (): Promise<string> => {
+      const status = await pi.exec("git", ["status", "--short", "--branch"], { timeout: 10_000 });
+      const head = await pi.exec("git", ["rev-parse", "HEAD"], { timeout: 10_000 });
+      const parts = [
+        status.code === 0 ? status.stdout.trim() : `git status unavailable: ${status.stderr.trim()}`,
+        head.code === 0 ? `HEAD ${head.stdout.trim()}` : "",
+      ].filter(Boolean);
+      return parts.join("\n") || "(unavailable)";
+    };
+
+    let gitState = "(unavailable)";
+    try { gitState = await git(); } catch { /* bounded best effort */ }
+    pi.sendMessage(
+      { customType: "golem-compaction-resteer", content: compactionResteer(task, count, gitState), display: true },
+      { deliverAs: "steer", triggerTurn: true },
+    );
   });
 
   // Monotonic question id: distinguishes successive blocks within one worker so

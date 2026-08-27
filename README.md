@@ -62,6 +62,8 @@ Project paths and pi provider/model references are validated at startup. Dispatc
 
 Provider descriptors and credentials are not accepted over the wire. For pi, `<provider>/<model>` resolves against operator config and `api_key_env` is read from golemd's own environment only while its private per-job profile is written.
 
+Workers are host-native, not cosmetic sandboxes: they inherit golemd's Unix permissions, network, and development substrate. The Nix package wraps `golemd` with `nix`, `nix-shell`, and `nix-store` on `PATH`, so workers can use the host Nix daemon directly instead of rebuilding ad hoc tool environments. Deployments that require genuine isolation must use a separate namespace/VM boundary rather than hiding those commands from `PATH`.
+
 ## CLI commands
 
 - `capabilities`

@@ -21,7 +21,7 @@
         cli = build "golem" [ "./cmd/golem" ];
         daemon = (build "golemd" [ "./cmd/golemd" ]).overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
-            wrapProgram $out/bin/golemd --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.bash ]}
+            wrapProgram $out/bin/golemd --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.tmux pkgs.git pkgs.bash pkgs.nix ]}
           '';
         });
         # Combined output for deployment: one profile carrying every Golem

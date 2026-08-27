@@ -6,7 +6,16 @@ import { expect, test, describe } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { appendEvent, assistantText, blockedEvent, blockedResultText, finalAssistant, settledEvent } from "./events.ts";
+import {
+  appendEvent,
+  assistantText,
+  blockedEvent,
+  blockedResultText,
+  compactionResteer,
+  finalAssistant,
+  nextCompactionCount,
+  settledEvent,
+} from "./events.ts";
 
 describe("assistantText", () => {
   test("joins text blocks and trims", () => {
@@ -55,6 +64,34 @@ describe("blockedEvent", () => {
     const t = blockedResultText();
     expect(t).toContain("End your turn");
     expect(t).toContain("next message");
+  });
+});
+
+describe("compaction policy", () => {
+  test("counts active-branch compactions and ignores other entries", () => {
+    expect(nextCompactionCount([])).toBe(1);
+    expect(nextCompactionCount([{ type: "message" }, { type: "compaction" }, { type: "custom" }])).toBe(2);
+    expect(nextCompactionCount([{ type: "compaction" }, { type: "compaction" }, { type: "compaction" }])).toBe(4);
+  });
+
+  test("re-steer repeats dispatch and state checklist; third is finish-or-block", () => {
+    const task = {
+      id: "job-1",
+      harness: "pi",
+      model: "op/model",
+      cwd: "/work",
+      prompt: "Implement X. Do not push.",
+      workspace: { project: "p", worktree: "wt", path: "/work" },
+    };
+    const normal = compactionResteer(task, 1, "## main\nHEAD abc");
+    expect(normal).toContain("Original dispatch (verbatim):\nImplement X. Do not push.");
+    expect(normal).toContain("edits made and commands/tests already run");
+    expect(normal).toContain("whether pushing remains authorized");
+    expect(normal).toContain("worktree=wt");
+    const final = compactionResteer(task, 3, "clean");
+    expect(final).toContain("FINAL COMPACTION BUDGET");
+    expect(final).toContain("agents_block");
+    expect(final).toContain("Do not broaden scope");
   });
 });
 

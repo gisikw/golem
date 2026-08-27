@@ -548,6 +548,13 @@ func (s *Supervisor) observe(ctx context.Context) error {
 			return err
 		}
 		s.settleWorker(w, settlement.At, settlement.State)
+		if obs.Terminate {
+			// Policy exhaustion is an immediate process boundary, not ordinary
+			// settlement linger. The artifacts/session remain retained by Golem.
+			if killErr := s.Tmux.Kill(ctx, w.Session); killErr != nil {
+				s.log().Warn("exhausted worker kill failed", "job", id, "error", killErr)
+			}
+		}
 	}
 	return nil
 }

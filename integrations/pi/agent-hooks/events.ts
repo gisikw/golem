@@ -11,6 +11,8 @@
  *   {"type":"progress","ts":<ms>,"turn":<n>,"message":"<short>"}
  *   {"type":"settled","ts":<ms>,"verdict":"done","summary":"<text>","usage":{...}}
  *   {"type":"blocked","ts":<ms>,"id":"<qid>","prompt":"<question>","options":["a","b"]}
+ *   {"type":"compaction","ts":<ms>,"count":<n>,"reason":"threshold"}
+ *   {"type":"exhausted","ts":<ms>,"count":4,"reason":"compaction limit reached"}
  *
  * The blocked record is emitted by the agent_block tool (index.ts): pi has no
  * native "ask the operator" mechanism, so blocking is an explicit agent action.
@@ -29,7 +31,73 @@ export type SideEvent =
       summary?: string;
       usage?: { input: number; output: number; cost: number };
     }
-  | { type: "blocked"; ts: number; id: string; prompt: string; options?: string[] };
+  | { type: "blocked"; ts: number; id: string; prompt: string; options?: string[] }
+  | { type: "compaction"; ts: number; count: number; reason: string }
+  | { type: "exhausted"; ts: number; count: number; reason: string };
+
+export interface TaskContext {
+  id?: string;
+  harness?: string;
+  model?: string;
+  cwd?: string;
+  prompt?: string;
+  workspace?: {
+    project?: string;
+    repo?: string;
+    ref?: string;
+    worktree?: string;
+    path?: string;
+  } | null;
+}
+
+/** Number this compaction will become on the active branch. */
+export function nextCompactionCount(branchEntries: unknown[]): number {
+  return branchEntries.filter(
+    (entry) => entry && typeof entry === "object" && (entry as { type?: unknown }).type === "compaction",
+  ).length + 1;
+}
+
+/**
+ * Build the durable reorientation packet injected immediately after a worker
+ * compaction. The original dispatch is repeated verbatim; live Git state is
+ * sampled after compaction. The compacted summary immediately preceding this
+ * packet remains authoritative for edits/tests/failures already encountered.
+ */
+export function compactionResteer(task: TaskContext, count: number, gitState: string): string {
+  const ws = task.workspace ?? undefined;
+  const workspace = ws
+    ? [
+        ws.project ? `project=${ws.project}` : "",
+        ws.repo ? `repo=${ws.repo}` : "",
+        ws.ref ? `ref=${ws.ref}` : "",
+        ws.worktree ? `worktree=${ws.worktree}` : "",
+        ws.path ? `path=${ws.path}` : "",
+      ].filter(Boolean).join(" ")
+    : "(unmanaged cwd)";
+  const urgency = count >= 3
+    ? "FINAL COMPACTION BUDGET: finish the assignment now, or call agents_block with the precise blocker. Do not broaden scope."
+    : "Resume the delegated assignment without broadening scope.";
+  return [
+    `[GOLEM COMPACTION RE-STEER ${count}/3]`,
+    urgency,
+    "",
+    "Original dispatch (verbatim):",
+    task.prompt ?? "(missing dispatch)",
+    "",
+    `Job: ${task.id ?? "?"}  harness/model: ${task.harness ?? "?"}/${task.model ?? "?"}`,
+    `Workspace: ${workspace}`,
+    `CWD: ${task.cwd ?? "?"}`,
+    "Live Git state:",
+    gitState || "(unavailable)",
+    "",
+    "Before the next tool call, explicitly reorient against the compaction summary and this packet:",
+    "- acceptance criteria and prohibitions from the original dispatch;",
+    "- edits made and commands/tests already run;",
+    "- unresolved failures or questions;",
+    "- the precise next action;",
+    "- whether pushing remains authorized (never infer authorization).",
+  ].join("\n");
+}
 
 /** Minimal shape of a pi assistant message we read for settlement content. */
 export interface AssistantLike {
