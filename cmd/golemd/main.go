@@ -120,10 +120,16 @@ func main() {
 	piProviders := make(map[string]piadapter.Provider, len(cfg.Providers))
 	providerNames := make(map[string]bool, len(cfg.Providers))
 	for name, provider := range cfg.Providers {
-		piProviders[name] = piadapter.Provider{BaseURL: provider.BaseURL, APIKeyEnv: provider.APIKeyEnv}
+		piProviders[name] = piadapter.Provider{Kind: provider.Kind, BaseURL: provider.BaseURL, APIKeyEnv: provider.APIKeyEnv}
 		providerNames[name] = true
 	}
-	piAdapter := piadapter.Adapter{Binary: *piBinary, HookExtension: os.Getenv("GOLEM_HOOK_EXTENSION"), WebExtension: os.Getenv("GOLEM_WEB_EXTENSION"), SourceProfile: env("GOLEM_PI_SOURCE_PROFILE", os.Getenv("PI_CODING_AGENT_DIR")), CopyAuth: os.Getenv("GOLEM_COPY_AUTH") == "1", DefaultProvider: os.Getenv("GOLEM_PI_DEFAULT_PROVIDER"), DefaultModel: os.Getenv("GOLEM_PI_DEFAULT_MODEL"), Providers: piProviders}
+	piEnv := map[string]string{}
+	for _, name := range []string{"GOLEM_TIAMAT_URL", "GOLEM_TIAMAT_TOKEN_FILE"} {
+		if value := os.Getenv(name); value != "" {
+			piEnv[name] = value
+		}
+	}
+	piAdapter := piadapter.Adapter{Binary: *piBinary, HookExtension: os.Getenv("GOLEM_HOOK_EXTENSION"), WebExtension: os.Getenv("GOLEM_WEB_EXTENSION"), SourceProfile: env("GOLEM_PI_SOURCE_PROFILE", os.Getenv("PI_CODING_AGENT_DIR")), CopyAuth: os.Getenv("GOLEM_COPY_AUTH") == "1", DefaultProvider: os.Getenv("GOLEM_PI_DEFAULT_PROVIDER"), DefaultModel: os.Getenv("GOLEM_PI_DEFAULT_MODEL"), Providers: piProviders, Env: piEnv}
 	adapters := supervisor.ConfiguredAdapters(piAdapter, argvEnv("GOLEM_CLAUDE_ARGV", []string{"claude", "{prompt}"}), argvEnv("GOLEM_CODEX_ARGV", []string{"codex", "{prompt}"}))
 	for harness := range cfg.Harnesses {
 		if _, ok := adapters[harness]; !ok {

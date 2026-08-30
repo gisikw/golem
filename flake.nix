@@ -46,6 +46,12 @@
             bun test ./agent-hooks/events.test.ts
             touch $out
           '';
+          tiamat-extension = pkgs.runCommand "golem-tiamat-extension-tests" { nativeBuildInputs = [ pkgs.bun ]; } ''
+            cp -r ${./integrations/pi/tiamat} ./tiamat
+            chmod -R u+w ./tiamat
+            bun test ./tiamat/catalog.test.ts
+            touch $out
+          '';
         };
         devShells.default = pkgs.mkShell {
           # pi is pinned here deliberately: workers resolve `pi` from PATH, and an

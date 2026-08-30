@@ -170,6 +170,54 @@ func TestConfiguredProviderProfile(t *testing.T) {
 	}
 }
 
+func TestTiamatProviderUsesEmbeddedExtensionWithoutWorkerCredentials(t *testing.T) {
+	dir := t.TempDir()
+	a := Adapter{
+		Binary: "fake-pi",
+		Providers: map[string]Provider{
+			"tiamat-responses-codex-personal": {Kind: "tiamat"},
+		},
+		Env: map[string]string{
+			"GOLEM_TIAMAT_URL":        "https://router.example",
+			"GOLEM_TIAMAT_TOKEN_FILE": "/run/secrets/router-token",
+		},
+	}
+	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Model: "tiamat-responses-codex-personal/gpt-5.6-sol", Artifacts: protocol.ArtifactMetadata{Directory: dir}}
+	launch, err := a.Start(context.Background(), j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := os.ReadFile(filepath.Join(dir, "pi", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Extensions    []string `json:"extensions"`
+		EnabledModels []string `json:"enabledModels"`
+	}
+	if err = json.Unmarshal(settings, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Extensions) != 2 || !strings.HasSuffix(got.Extensions[1], "golem-tiamat/index.ts") {
+		t.Fatalf("Tiamat extension not isolated into worker: %#v", got.Extensions)
+	}
+	if len(got.EnabledModels) != 1 || got.EnabledModels[0] != j.Model {
+		t.Fatalf("dispatched model not pinned: %#v", got.EnabledModels)
+	}
+	if _, err = os.Stat(filepath.Join(dir, "pi", "golem-tiamat", "catalog.ts")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(filepath.Join(dir, "pi", "models.json")); !os.IsNotExist(err) {
+		t.Fatalf("dynamic provider wrote static models.json: %v", err)
+	}
+	if launch.Env["GOLEM_TIAMAT_TOKEN_FILE"] != "/run/secrets/router-token" {
+		t.Fatalf("Router token path not passed to worker: %#v", launch.Env)
+	}
+	if strings.Contains(string(settings), "router-token") {
+		t.Fatalf("Router token path leaked into worker settings: %s", settings)
+	}
+}
+
 func TestBuiltInHookIsMaterializedByDefault(t *testing.T) {
 	dir := t.TempDir()
 	j := protocol.Job{ID: "j", Prompt: "go", CWD: dir, Artifacts: protocol.ArtifactMetadata{Directory: dir}}

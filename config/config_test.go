@@ -23,6 +23,21 @@ func TestLoadNestedHarnessModelsAndProjects(t *testing.T) {
 	}
 }
 
+func TestLoadTiamatProviderWithoutStaticEndpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "golemd.toml")
+	data := "name = \"test\"\n[providers.tiamat-responses-codex-personal]\nkind = \"tiamat\"\n[harnesses.pi]\nmodels = [\"tiamat-responses-codex-personal/gpt-5.6-sol\"]\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers["tiamat-responses-codex-personal"].Kind != "tiamat" {
+		t.Fatalf("tiamat provider lost: %#v", cfg.Providers)
+	}
+}
+
 func TestLoadRejectsMissingAndRelativeProjectPaths(t *testing.T) {
 	for name, project := range map[string]string{"relative": "somewhere", "missing": filepath.Join(t.TempDir(), "missing")} {
 		t.Run(name, func(t *testing.T) {

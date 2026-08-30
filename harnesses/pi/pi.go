@@ -68,6 +68,7 @@ type Adapter struct {
 // Provider is operator-owned connection configuration. APIKeyEnv names a
 // variable in golemd's environment; its value is read only while provisioning.
 type Provider struct {
+	Kind      string
 	BaseURL   string
 	APIKeyEnv string
 }
@@ -195,18 +196,26 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 		}
 	}
 	configured := false
+	var configuredProvider Provider
 	if dispatchedModel != "" {
 		var ok bool
 		provider, model, ok = strings.Cut(dispatchedModel, "/")
 		if !ok || provider == "" || model == "" {
 			return fmt.Errorf("pi model %q must be provider/model", dispatchedModel)
 		}
-		if _, ok = a.Providers[provider]; !ok {
+		if configuredProvider, ok = a.Providers[provider]; !ok {
 			return fmt.Errorf("pi provider %q is not configured", provider)
 		}
 		configured = true
 	}
 	extensions := a.workerExtensions()
+	if configured && configuredProvider.Kind == "tiamat" {
+		builtIn, err := piintegration.WriteTiamat(dir)
+		if err != nil {
+			return err
+		}
+		extensions = append(extensions, builtIn)
+	}
 	if a.HookExtension == "" {
 		builtIn, err := piintegration.WriteHooks(dir)
 		if err != nil {
@@ -227,28 +236,30 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 		settings["defaultModel"] = model
 	}
 	if configured {
-		p := a.Providers[provider]
-		modelEntry := map[string]any{"id": model, "name": model, "reasoning": false, "input": []string{"text"}, "cost": map[string]int{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 131072, "maxTokens": 16384}
-		entry := map[string]any{"name": provider, "baseUrl": p.BaseURL, "api": "openai-completions", "models": []map[string]any{modelEntry}}
-		if p.APIKeyEnv != "" {
-			key, ok := os.LookupEnv(p.APIKeyEnv)
-			if !ok || key == "" {
-				return fmt.Errorf("pi provider %q requires daemon environment %s", provider, p.APIKeyEnv)
+		if configuredProvider.Kind != "tiamat" {
+			p := configuredProvider
+			modelEntry := map[string]any{"id": model, "name": model, "reasoning": false, "input": []string{"text"}, "cost": map[string]int{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 131072, "maxTokens": 16384}
+			entry := map[string]any{"name": provider, "baseUrl": p.BaseURL, "api": "openai-completions", "models": []map[string]any{modelEntry}}
+			if p.APIKeyEnv != "" {
+				key, ok := os.LookupEnv(p.APIKeyEnv)
+				if !ok || key == "" {
+					return fmt.Errorf("pi provider %q requires daemon environment %s", provider, p.APIKeyEnv)
+				}
+				entry["apiKey"] = key
+				entry["authHeader"] = true
+			} else {
+				// pi requires an apiKey before a model appears in /model, even for
+				// keyless OpenAI-compatible servers (see pi docs/models.md). Keep the
+				// documented dummy-value workaround for auth-free providers.
+				entry["apiKey"] = "golem-keyless"
 			}
-			entry["apiKey"] = key
-			entry["authHeader"] = true
-		} else {
-			// pi requires an apiKey before a model appears in /model, even for
-			// keyless OpenAI-compatible servers (see pi docs/models.md). Keep the
-			// documented dummy-value workaround for auth-free providers.
-			entry["apiKey"] = "golem-keyless"
-		}
-		modelsJSON, err := json.MarshalIndent(map[string]any{"providers": map[string]any{provider: entry}}, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err = os.WriteFile(filepath.Join(dir, "models.json"), modelsJSON, 0o600); err != nil {
-			return err
+			modelsJSON, err := json.MarshalIndent(map[string]any{"providers": map[string]any{provider: entry}}, "", "  ")
+			if err != nil {
+				return err
+			}
+			if err = os.WriteFile(filepath.Join(dir, "models.json"), modelsJSON, 0o600); err != nil {
+				return err
+			}
 		}
 		settings["enabledModels"] = []string{provider + "/" + model}
 	} else {

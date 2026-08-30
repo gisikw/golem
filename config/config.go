@@ -19,6 +19,10 @@ type Harness struct {
 }
 
 type Provider struct {
+	// Kind is empty for a statically configured OpenAI-compatible provider.
+	// "tiamat" delegates provider/model registration to Golem's isolated pi
+	// extension and therefore requires no base URL or provider credential here.
+	Kind      string `toml:"kind"`
 	BaseURL   string `toml:"base_url"`
 	APIKeyEnv string `toml:"api_key_env"`
 }
@@ -77,8 +81,20 @@ func Load(path string) (Config, error) {
 		}
 	}
 	for name, p := range c.Providers {
-		if name == "" || p.BaseURL == "" {
-			return Config{}, fmt.Errorf("provider %q requires base_url", name)
+		if name == "" {
+			return Config{}, errors.New("provider name cannot be empty")
+		}
+		switch p.Kind {
+		case "":
+			if p.BaseURL == "" {
+				return Config{}, fmt.Errorf("provider %q requires base_url", name)
+			}
+		case "tiamat":
+			if p.BaseURL != "" || p.APIKeyEnv != "" {
+				return Config{}, fmt.Errorf("tiamat provider %q must not set base_url or api_key_env", name)
+			}
+		default:
+			return Config{}, fmt.Errorf("provider %q has unsupported kind %q", name, p.Kind)
 		}
 		if p.APIKeyEnv != "" && !validEnvName(p.APIKeyEnv) {
 			return Config{}, fmt.Errorf("provider %q has invalid api_key_env", name)
