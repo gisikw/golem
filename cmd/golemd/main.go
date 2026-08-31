@@ -130,7 +130,11 @@ func main() {
 		}
 	}
 	piAdapter := piadapter.Adapter{Binary: *piBinary, HookExtension: os.Getenv("GOLEM_HOOK_EXTENSION"), WebExtension: os.Getenv("GOLEM_WEB_EXTENSION"), SourceProfile: env("GOLEM_PI_SOURCE_PROFILE", os.Getenv("PI_CODING_AGENT_DIR")), CopyAuth: os.Getenv("GOLEM_COPY_AUTH") == "1", DefaultProvider: os.Getenv("GOLEM_PI_DEFAULT_PROVIDER"), DefaultModel: os.Getenv("GOLEM_PI_DEFAULT_MODEL"), Providers: piProviders, Env: piEnv}
-	adapters := supervisor.ConfiguredAdapters(piAdapter, argvEnv("GOLEM_CLAUDE_ARGV", []string{"claude", "{prompt}"}), argvEnv("GOLEM_CODEX_ARGV", []string{"codex", "{prompt}"}))
+	var claudeArgv []string
+	if os.Getenv("GOLEM_CLAUDE_ARGV") != "" {
+		claudeArgv = argvEnv("GOLEM_CLAUDE_ARGV", nil)
+	}
+	adapters := supervisor.ConfiguredAdapters(piAdapter, claudeArgv, argvEnv("GOLEM_CODEX_ARGV", []string{"codex", "{prompt}"}))
 	for harness := range cfg.Harnesses {
 		if _, ok := adapters[harness]; !ok {
 			slog.Error("configured harness has no adapter", "harness", harness)

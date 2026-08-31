@@ -91,7 +91,11 @@ func DefaultAdapters(piBinary string, claudeArgv, codexArgv []string) map[string
 }
 
 func ConfiguredAdapters(pi piadapter.Adapter, claudeArgv, codexArgv []string) map[string]harnesses.Adapter {
-	return map[string]harnesses.Adapter{"pi": pi, "claude": claude.Adapter{ArgvTemplate: claudeArgv}, "codex": codex.Adapter{ArgvTemplate: codexArgv}, "fake": claude.Adapter{ArgvTemplate: []string{"sh", "-c", "printf '%s\\n' fake-worker-complete; printf '%s\\n' fake-artifact >\"$GOLEM_ARTIFACT_DIR/result.txt\"; sleep 1"}}}
+	ca := claude.Adapter{Binary: "claude"}
+	if len(claudeArgv) > 0 {
+		ca.ArgvTemplate = claudeArgv
+	} // explicit test/deployment override
+	return map[string]harnesses.Adapter{"pi": pi, "claude": ca, "codex": codex.Adapter{ArgvTemplate: codexArgv}, "fake": claude.Adapter{ArgvTemplate: []string{"sh", "-c", "printf '%s\\n' fake-worker-complete; printf '%s\\n' fake-artifact >\"$GOLEM_ARTIFACT_DIR/result.txt\"; sleep 1"}}}
 }
 
 // Recover adopts surviving sessions. Only pi (currently the only resumable

@@ -29,8 +29,12 @@ it yet.
 
 ## Minimal adapters
 
-`TemplateAdapter` (used by Claude and Codex) is the honest minimum for harnesses
-without a lifecycle API: it launches configured argv, keeps the tee-to-file
-transcript, and infers only process exit/transcript operator. Unsupported native
-operations (steering, blocked questions, usage, resume) return `ErrUnsupported`.
-No adapter binary is required for unit tests; tests use shell fakes.
+`TemplateAdapter` remains the dependency-free fallback used by Codex and test
+fakes. Claude Code is different: `harnesses/claude` launches the pinned
+nixpkgs Claude Code binary interactively, with `ANTHROPIC_BASE_URL` fixed to the
+unmanaged Golem router and `--model` forwarded verbatim. It writes a private
+`CLAUDE_CONFIG_DIR` below the job artifacts and supplies Claude command hooks
+for running/progress, permission-wait (blocked), and stop (settled) events.
+Settlement usage is reconciled from Claude's JSONL transcripts. Steering and
+answers are delivered to the interactive pane just like pi; resume remains
+unsupported until Claude's session-resume CLI contract is stable.
