@@ -7,7 +7,12 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        # claude-code is unfree; fort.tracked builds this flake purely, so the
+        # allowance has to live here rather than in an env var.
+        pkgs = import nixpkgs {
+          inherit system;
+          config.allowUnfreePredicate = pkg: builtins.elem (nixpkgs.lib.getName pkg) [ "claude-code" ];
+        };
         build = name: subPackages: pkgs.buildGoModule {
           pname = name;
           version = "0.1.0";
