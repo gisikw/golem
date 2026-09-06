@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -50,5 +51,52 @@ func TestLoadRejectsMissingAndRelativeProjectPaths(t *testing.T) {
 				t.Fatal("invalid project accepted")
 			}
 		})
+	}
+}
+
+// [herdr] is optional: its absence must leave the daemon on tmux, and its
+// presence must resolve a socket without inventing one.
+func TestHerdrSectionIsOptionalAndResolvesASocket(t *testing.T) {
+	base := "name = \"test\"\n[harnesses.fake]\nmodels = []\n"
+	write := func(body string) string {
+		path := filepath.Join(t.TempDir(), "golemd.toml")
+		if err := os.WriteFile(path, []byte(base+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	cfg, err := Load(write(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Herdr != nil {
+		t.Fatal("absent [herdr] must not select the herdr backend")
+	}
+	cfg, err = Load(write("[herdr]\nsocket = \"/run/herdr/golem.sock\"\nreconcile_interval = \"15s\"\nstartup_timeout_ms = 60000\n[herdr.kinds]\npi = \"pi\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket, err := cfg.Herdr.SocketPath()
+	if err != nil || socket != "/run/herdr/golem.sock" {
+		t.Fatalf("socket %q %v", socket, err)
+	}
+	if interval, intervalErr := cfg.Herdr.Reconcile(); intervalErr != nil || interval.String() != "15s" {
+		t.Fatalf("reconcile %v %v", interval, intervalErr)
+	}
+	if cfg.Herdr.Kinds["pi"] != "pi" {
+		t.Fatalf("kinds %v", cfg.Herdr.Kinds)
+	}
+	cfg, err = Load(write("[herdr]\nsession = \"golem\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if socket, err = cfg.Herdr.SocketPath(); err != nil || !strings.HasSuffix(socket, "/.config/herdr/sessions/golem/herdr.sock") {
+		t.Fatalf("session socket %q %v", socket, err)
+	}
+	if _, err = Load(write("[herdr]\nstartup_timeout_ms = 10\n")); err == nil {
+		t.Fatal("out-of-range startup_timeout_ms accepted")
+	}
+	if _, err = Load(write("[herdr]\nreconcile_interval = \"soon\"\n")); err == nil {
+		t.Fatal("unparseable reconcile_interval accepted")
 	}
 }
