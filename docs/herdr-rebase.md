@@ -241,6 +241,7 @@ socket_path = ""                  # optional explicit override
 min_version = "0.8.1"             # checked via ping/status at startup, fail closed
 startup_timeout_ms = 60000        # agent.start bound
 reconcile_interval = "15s"
+pi_extension = "/var/lib/golem/herdr-pi-seed/extensions/herdr-agent-state.ts"
 
 [herdr.kinds]                     # golem harness → herdr agent kind
 pi = "pi"
@@ -255,7 +256,11 @@ path = "/tmp"
 # [attach_ssh] is gone.
 ```
 
-Herdr-side operator requirements, stated once: `herdr integration install pi` (lifecycle authority),
+Herdr-side operator requirements, stated once: create the stable seed and install Pi's lifecycle
+extension on fort-nix with `sudo install -d -o familiar -g users -m 0700 /var/lib/golem/herdr-pi-seed`, then
+`sudo -u familiar env PI_CODING_AGENT_DIR=/var/lib/golem/herdr-pi-seed herdr integration install pi`,
+and configure `pi_extension = "/var/lib/golem/herdr-pi-seed/extensions/herdr-agent-state.ts"`.
+Never install into a job-private profile. Also set
 `[session] resume_agents_on_restore = false` for the golem session (Golem, not Herdr, decides
 whether a job resumes after a cold restart — reviving an agent whose job was cancelled is the
 failure mode Wings documented), and a pinned Herdr version.
@@ -305,7 +310,7 @@ then `golem status`, `golem await`, and `golem cancel` on a second job — with 
 - `workspace.close` gives no documented descendant-termination guarantee; cancel can be unverifiable.
 - Claude `blocked` is screen-manifest only and deliberately conservative: novel prompts read as `idle`, so a job can look running while it waits forever.
 - Herdr's socket is unauthenticated and user-scoped; any network exposure moves the trust boundary entirely onto the tailnet.
-- Golem's per-job `PI_CODING_AGENT_DIR` profile and Herdr's pi integration both write that directory; Golem must include Herdr's `herdr-agent-state.ts` in its explicit extension list or lose lifecycle authority (decision 16 becomes a two-writer problem).
+- **Provisioning boundary implemented:** Herdr writes `herdr-agent-state.ts` only once into an operator-owned seed; Golem snapshots its bytes into each per-job `PI_CODING_AGENT_DIR` with mode `0600` before writing the explicit extension allowlist. Herdr is never a second writer to job profiles, and concurrent workers share neither settings nor extension destinations. **Remaining risk:** the operator can replace the mutable seed between dispatches, so workers may intentionally run different Herdr integration bytes over time; pin and update the seed as deployment configuration. If the configured source disappears or becomes unreadable, Golem now fails the affected start loudly rather than silently losing lifecycle authority.
 - One Herdr server per host is a shared fate: `herdr server stop` or a bad config reload takes every job on that host with it.
 - Herdr version drift: detection manifests update themselves remotely by default, so state classification can change under a running golemd unless `[update] manifest_check = false`.
 - Agent names are capped at 32 chars and must be unique among *live* agents; a reused job-id prefix after a crash could bind to the wrong pane if adoption does not also check workspace and cwd.

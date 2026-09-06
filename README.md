@@ -32,7 +32,25 @@ On the herdr backend, in this first cut:
 - state observations map `working`/`idle`/`done` → running, `blocked` → blocked, `unknown` → last known state flagged stale, and `as_of` is golemd's receipt time (Herdr events carry no timestamp and no resumable cursor);
 - Herdr's server is not golemd's to stop, so shutdown leaves live agents alone and re-adopts them by name on the next start.
 
-Operator requirements on the Herdr side: `herdr integration install pi`, a pinned Herdr version, and a pane shell that does not clobber `PATH` (`[terminal] default_shell` — Herdr resolves the harness executable through the pane's `PATH`, and an interactive login shell may replace it with the system default). `./test/herdr-smoke.sh` starts a disposable herdr server configured exactly that way and runs a real pi job through it.
+Herdr's Pi integration is a lifecycle extension, but Herdr installs it into the `PI_CODING_AGENT_DIR` visible to the install command. Golem workers intentionally use a different, private directory per job. Provision one stable, operator-owned **seed** and point `[herdr].pi_extension` at the installed file:
+
+```sh
+# fort-nix (golemd runs as familiar:users); adapt owner for other deployments:
+sudo install -d -o familiar -g users -m 0700 /var/lib/golem/herdr-pi-seed
+sudo -u familiar env PI_CODING_AGENT_DIR=/var/lib/golem/herdr-pi-seed \
+  herdr integration install pi
+# Installed source consumed by golemd:
+test -f /var/lib/golem/herdr-pi-seed/extensions/herdr-agent-state.ts
+```
+
+```toml
+[herdr]
+pi_extension = "/var/lib/golem/herdr-pi-seed/extensions/herdr-agent-state.ts"
+```
+
+Run the install only against the stable seed, never against a job artifact directory. On every Herdr-backed Pi start, Golem snapshots those exact bytes to `$ARTIFACT_DIR/pi/extensions/herdr-agent-state.ts` with mode `0600` and names only that private copy in the worker's explicit `settings.json` extension allowlist. The seed is never a worker profile, concurrent jobs never share a mutable profile, and Golem never asks Herdr to write a profile after creating it. Config loading rejects a missing/non-regular/non-absolute source; if it disappears later, that worker start fails loudly before settings are written. The default tmux backend does not read or require this setting.
+
+Other Herdr-side requirements are a pinned Herdr version and a pane shell that does not clobber `PATH` (`[terminal] default_shell` — Herdr resolves the harness executable through the pane's `PATH`, and an interactive login shell may replace it with the system default). `./test/herdr-smoke.sh` starts a disposable Herdr server, installs a disposable seed integration, and runs a real Pi job through it.
 
 ## Requirements
 
@@ -76,6 +94,7 @@ With no `--service`, the CLI uses `unix://~/.local/state/golem/golemd.sock`, mat
 - `clone_enabled` (defaults false)
 - `api_bearer_tokens`: bearer credentials enforced on every TCP request; Unix sockets are exempt
 - `[attach_ssh]`: optional port, host key path, and authorized_keys path (port 0 disables it)
+- `[herdr]`: optional Herdr backend; Herdr-backed Pi requires an absolute `pi_extension` seed path as described above
 
 Project paths and pi provider/model references are validated at startup. Dispatch selects either `--project NAME` or `--repo URL` plus `--worktree NAME`; the resulting `.golem/worktrees/NAME` is reused as the resume key. Repository cloning requires `clone_enabled`. Direct absolute `--cwd` remains a low-level test/fake-harness escape hatch.
 

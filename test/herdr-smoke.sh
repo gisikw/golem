@@ -29,6 +29,14 @@ session=${HERDR_SMOKE_SESSION:-golem-smoke-$$}
 socket="$herdr_home/.config/herdr/sessions/$session/herdr.sock"
 mkdir -p "$herdr_home"
 mkdir -p "$herdr_home/.config/herdr"
+# Install Herdr's Pi lifecycle integration only into an operator-owned seed.
+# Golem must copy it into private worker profiles; Herdr must never install into
+# those job directories after Golem creates them.
+seed="$state/herdr-pi-seed"
+mkdir -m 0700 "$seed"
+HOME="$herdr_home" PI_CODING_AGENT_DIR="$seed" "$herdr_bin" integration install pi
+seed_extension="$seed/extensions/herdr-agent-state.ts"
+[[ -f "$seed_extension" ]] || { echo "Herdr Pi integration did not create $seed_extension" >&2; exit 1; }
 # Operator requirement, learned the hard way (see README "Backends"): the pane
 # shell must not clobber the PATH golemd puts in the workspace env, or Herdr
 # cannot resolve the harness executable. On NixOS an interactive bash
@@ -97,6 +105,7 @@ description = "Herdr smoke project"
 socket = "$socket"
 reconcile_interval = "15s"
 startup_timeout_ms = 120000
+pi_extension = "$seed_extension"
 
 [herdr.kinds]
 pi = "pi"
@@ -128,6 +137,18 @@ for _ in $(seq 1 120); do
 done
 herdrctl workspace list
 herdrctl workspace list | grep -q "golem/$id" || { echo "no herdr workspace for the job" >&2; exit 1; }
+echo "--- private Herdr Pi lifecycle extension ---"
+worker_profile="$state/state/artifacts/$id/pi"
+worker_extension="$worker_profile/extensions/herdr-agent-state.ts"
+settings="$worker_profile/settings.json"
+seed_hash=$(sha256sum "$seed_extension" | cut -d' ' -f1)
+worker_hash=$(sha256sum "$worker_extension" | cut -d' ' -f1)
+[[ "$seed_hash" == "$worker_hash" ]] || { echo "worker extension bytes differ from seed" >&2; exit 1; }
+[[ $(stat -c %a "$worker_extension") == 600 ]] || { echo "worker extension is not mode 0600" >&2; exit 1; }
+grep -Fq "\"$worker_extension\"" "$settings" || { cat "$settings"; echo "private extension absent from settings allowlist" >&2; exit 1; }
+if grep -Fq "\"$seed_extension\"" "$settings"; then cat "$settings"; echo "settings references shared seed" >&2; exit 1; fi
+echo "seed:    $seed_extension"
+echo "private: $worker_extension"
 echo "--- herdr agent list ---"
 herdrctl agent list
 
