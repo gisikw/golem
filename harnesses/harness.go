@@ -24,6 +24,11 @@ type Launch struct {
 	// Events is the append-only side-channel path a harness's hook adapter
 	// writes lifecycle records to. Observe advances a durable cursor over it.
 	Events string `json:"events,omitempty"`
+	// Prompt is the job's initial task text. Argv-launching substrates pass it
+	// as the final argv element (tmux does, unchanged); substrates that submit
+	// text through an agent surface instead (herdr's agent.prompt) split it off
+	// only when it is exactly that final element.
+	Prompt string `json:"prompt,omitempty"`
 }
 
 type Runtime struct {

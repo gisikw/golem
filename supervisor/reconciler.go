@@ -150,7 +150,7 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 	local := s.Registry.Snapshot()
 	for _, d := range poll.Assignments {
 		if w, ok := local[d.Job.ID]; ok && d.Job.ReapRequested && !w.SettledAt.IsZero() {
-			_ = s.Backend.Kill(ctx, w.Session)
+			_ = s.Backend.Teardown(ctx, w.Session, w.Target)
 			_ = s.Registry.Delete(d.Job.ID)
 			continue
 		}
@@ -445,7 +445,7 @@ func (s *Supervisor) sendText(ctx context.Context, w Worker, text string) error 
 }
 
 func (s *Supervisor) runtime(w Worker) harnesses.Runtime {
-	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }, Cancel: func(ctx context.Context) error { return s.Backend.Kill(ctx, w.Session) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Backend.Pane(ctx, w.Target) }}
+	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }, Cancel: func(ctx context.Context) error { return s.Backend.Teardown(ctx, w.Session, w.Target) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Backend.Pane(ctx, w.Target) }}
 }
 func (s *Supervisor) reapExpired(ctx context.Context, now time.Time) {
 	linger := s.Linger
@@ -454,7 +454,7 @@ func (s *Supervisor) reapExpired(ctx context.Context, now time.Time) {
 	}
 	for id, w := range s.Registry.Snapshot() {
 		if !w.SettledAt.IsZero() && now.Sub(w.SettledAt) >= linger {
-			_ = s.Backend.Kill(ctx, w.Session)
+			_ = s.Backend.Teardown(ctx, w.Session, w.Target)
 			_ = s.Registry.Delete(id)
 		}
 	}
@@ -483,7 +483,7 @@ func (s *Supervisor) cancel(ctx context.Context, id string) {
 }
 func (s *Supervisor) forget(ctx context.Context, id string) {
 	if w, ok := s.Registry.Snapshot()[id]; ok {
-		_ = s.Backend.Kill(ctx, w.Session)
+		_ = s.Backend.Teardown(ctx, w.Session, w.Target)
 		_ = s.Registry.Delete(id)
 	}
 }
@@ -586,7 +586,7 @@ func (s *Supervisor) observe(ctx context.Context) error {
 		if obs.Terminate {
 			// Policy exhaustion is an immediate process boundary, not ordinary
 			// settlement linger. The artifacts/session remain retained by Golem.
-			if killErr := s.Backend.Kill(ctx, w.Session); killErr != nil {
+			if killErr := s.Backend.Teardown(ctx, w.Session, w.Target); killErr != nil {
 				s.log().Warn("exhausted worker kill failed", "job", id, "error", killErr)
 			}
 		}

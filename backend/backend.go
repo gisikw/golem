@@ -29,8 +29,9 @@ type Backend interface {
 	Start(ctx context.Context, id string, l harnesses.Launch) (session string, target string, err error)
 	// Has reports whether the substrate still holds this session.
 	Has(ctx context.Context, session string) bool
-	// Kill tears the job's substrate down (teardown, reap, forget).
-	Kill(ctx context.Context, session string) error
+	// Teardown removes the job's substrate entirely (settled-worker reap,
+	// forget, exhaustion kill).
+	Teardown(ctx context.Context, session, target string) error
 	// Cancel is the interactive cancellation path: interrupt the harness and,
 	// where the substrate requires it, verify the process is gone.
 	Cancel(ctx context.Context, session, target string) error

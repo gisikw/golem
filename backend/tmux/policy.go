@@ -37,3 +37,6 @@ func (t Tmux) Run(ctx context.Context, args ...string) (string, error) { return 
 // SafeName exposes the session-name sanitiser for tests that must predict a
 // worker's deterministic tmux target.
 func SafeName(id string) string { return safeName.ReplaceAllString(id, "-") }
+
+// Teardown is the historical Kill: destroy the worker's tmux session.
+func (t Tmux) Teardown(ctx context.Context, session, _ string) error { return t.Kill(ctx, session) }

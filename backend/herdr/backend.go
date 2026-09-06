@@ -1,0 +1,566 @@
+package herdr
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gisikw/golem/backend"
+	"github.com/gisikw/golem/harnesses"
+	"github.com/gisikw/golem/protocol"
+)
+
+// DefaultReconcile is the safety-net poll interval. Herdr's event envelopes
+// carry no sequence number and offer no resumable cursor, so a dropped
+// subscription is an observation gap until this poll closes it.
+const DefaultReconcile = 15 * time.Second
+
+// DefaultStartupTimeout bounds agent.start's own readiness wait.
+const DefaultStartupTimeout = 60 * time.Second
+
+var unsafeName = regexp.MustCompile(`[^a-z0-9_-]`)
+
+// AgentName is the durable binding between a Golem job and a Herdr agent.
+// Herdr names must match [a-z][a-z0-9_-]{0,31} and be unique among live
+// agents, so a restarted golemd can re-find its agent by name via agent.list.
+func AgentName(jobID string) string {
+	id := unsafeName.ReplaceAllString(strings.ToLower(jobID), "-")
+	name := "job-" + strings.TrimPrefix(id, "job-")
+	if len(name) > 32 {
+		name = name[:32]
+	}
+	return name
+}
+
+// Backend runs Golem jobs inside one Herdr session on this host. Session and
+// target handles are the agent name and the pane id; the supervisor persists
+// both in its durable worker registry, which is the job binding.
+type Backend struct {
+	// Socket is the session's Unix socket path.
+	Socket string
+	// Kinds maps a Golem harness (argv[0] base name) to a Herdr agent kind.
+	// Only pi is supported in the minimum viable cut.
+	Kinds map[string]string
+	// StartupTimeout bounds agent.start; Reconcile is the safety-net poll.
+	StartupTimeout time.Duration
+	Reconcile      time.Duration
+	Logger         *slog.Logger
+
+	mu       sync.Mutex
+	ctrl     *Conn
+	states   map[string]backend.Status // pane id -> last observation
+	watching map[string]context.CancelFunc
+	base     context.Context
+}
+
+func (b *Backend) log() *slog.Logger {
+	if b.Logger != nil {
+		return b.Logger
+	}
+	return slog.Default()
+}
+
+func (b *Backend) kind(harness string) (string, bool) {
+	kinds := b.Kinds
+	if len(kinds) == 0 {
+		kinds = map[string]string{"pi": "pi"}
+	}
+	k, ok := kinds[harness]
+	return k, ok
+}
+
+// conn returns the shared control connection, redialing when the previous one
+// died. Every call goes through it under the client's own lock.
+func (b *Backend) conn(ctx context.Context) (*Conn, error) {
+	b.mu.Lock()
+	c := b.ctrl
+	b.mu.Unlock()
+	if c != nil {
+		return c, nil
+	}
+	fresh, err := Dial(ctx, b.Socket)
+	if err != nil {
+		return nil, fmt.Errorf("herdr socket %s: %w", b.Socket, err)
+	}
+	b.mu.Lock()
+	if b.ctrl == nil {
+		b.ctrl = fresh
+	} else {
+		_ = fresh.Close()
+		fresh = b.ctrl
+	}
+	b.mu.Unlock()
+	return fresh, nil
+}
+
+func (b *Backend) drop(c *Conn) {
+	b.mu.Lock()
+	if b.ctrl == c {
+		b.ctrl = nil
+	}
+	b.mu.Unlock()
+	_ = c.Close()
+}
+
+// call runs one request against the control connection, redialing once when
+// the connection has gone away underneath us. Herdr error frames are returned
+// as-is: they are answers, not transport failures.
+func (b *Backend) call(ctx context.Context, f func(*Conn) error) error {
+	c, err := b.conn(ctx)
+	if err != nil {
+		return err
+	}
+	err = f(c)
+	var herdrErr *Error
+	if err == nil || errors.As(err, &herdrErr) || ctx.Err() != nil {
+		return err
+	}
+	b.drop(c)
+	if c, err = b.conn(ctx); err != nil {
+		return err
+	}
+	return f(c)
+}
+
+// Prepare is the startup capability check: the socket must be reachable and
+// speak exactly protocol 20. golemd falls back to tmux (loudly) when it fails.
+func (b *Backend) Prepare() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := b.conn(ctx)
+	if err != nil {
+		return err
+	}
+	version, proto, err := c.Ping(ctx)
+	if err != nil {
+		b.drop(c)
+		return fmt.Errorf("herdr ping: %w", err)
+	}
+	if proto != Protocol {
+		return fmt.Errorf("herdr protocol %d unsupported (golem speaks %d; server version %s)", proto, Protocol, version)
+	}
+	b.log().Info("herdr backend ready", "socket", b.Socket, "version", version, "protocol", proto)
+	return nil
+}
+
+// Run owns the asynchronous half: it holds the context every per-pane event
+// subscription lives under and runs the reconcile poll that closes the gaps a
+// dropped subscription leaves behind.
+func (b *Backend) Run(ctx context.Context) {
+	b.mu.Lock()
+	b.base = ctx
+	b.mu.Unlock()
+	interval := b.Reconcile
+	if interval <= 0 {
+		interval = DefaultReconcile
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.reconcile(ctx)
+		}
+	}
+}
+
+// reconcile is the safety net and the restart-adoption read: one agent.list,
+// stamped with the time the response was read.
+func (b *Backend) reconcile(ctx context.Context) {
+	var agents []AgentInfo
+	err := b.call(ctx, func(c *Conn) error {
+		var e error
+		agents, e = c.AgentList(ctx)
+		return e
+	})
+	if err != nil {
+		if ctx.Err() == nil {
+			b.log().Warn("herdr reconcile failed", "error", err)
+		}
+		return
+	}
+	at := time.Now().UTC()
+	live := map[string]bool{}
+	for _, a := range agents {
+		live[a.PaneID] = true
+		b.record(a.PaneID, a.AgentStatus, at)
+		b.watch(a.PaneID)
+	}
+	b.mu.Lock()
+	for pane := range b.states {
+		if !live[pane] {
+			status := b.states[pane]
+			status.Present, status.AsOf = false, at
+			b.states[pane] = status
+		}
+	}
+	b.mu.Unlock()
+}
+
+// record applies one observation. unknown keeps the last known state and only
+// raises the stale flag, exactly as the mapping table requires.
+func (b *Backend) record(pane, herdrStatus string, at time.Time) {
+	state, stale, known := MapStatus(herdrStatus)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.states == nil {
+		b.states = map[string]backend.Status{}
+	}
+	status := b.states[pane]
+	status.Present, status.AsOf, status.Stale = true, at, stale
+	if !known {
+		b.log().Warn("unrecognised herdr agent status", "pane", pane, "status", herdrStatus)
+	}
+	if state != "" {
+		status.State = state
+	}
+	b.states[pane] = status
+}
+
+// Status implements backend.Observer: the supervisor uses it only to stamp an
+// honest as_of on the state events it publishes.
+func (b *Backend) Status(target string) (backend.Status, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.states[target]
+	return s, ok
+}
+
+// watch subscribes to one pane's agent status changes. Protocol 20 requires a
+// pane_id per subscription, so this is one connection per live job. as_of is
+// the receipt time of the pushed line; a drop ends the goroutine and the
+// reconcile poll re-establishes it.
+func (b *Backend) watch(pane string) {
+	b.mu.Lock()
+	if b.watching == nil {
+		b.watching = map[string]context.CancelFunc{}
+	}
+	base := b.base
+	_, already := b.watching[pane]
+	if already || base == nil {
+		b.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(base)
+	b.watching[pane] = cancel
+	b.mu.Unlock()
+
+	go func() {
+		defer func() {
+			cancel()
+			b.mu.Lock()
+			delete(b.watching, pane)
+			b.mu.Unlock()
+		}()
+		c, err := Dial(ctx, b.Socket)
+		if err != nil {
+			b.log().Warn("herdr subscription dial failed", "pane", pane, "error", err)
+			return
+		}
+		events, err := c.Subscribe(ctx, []map[string]any{{"type": "pane.agent_status_changed", "pane_id": pane}})
+		if err != nil {
+			_ = c.Close()
+			b.log().Warn("herdr subscribe failed", "pane", pane, "error", err)
+			return
+		}
+		for event := range events {
+			var data struct {
+				PaneID      string `json:"pane_id"`
+				AgentStatus string `json:"agent_status"`
+			}
+			if json.Unmarshal(event.Data, &data) != nil || data.PaneID == "" {
+				continue
+			}
+			b.record(data.PaneID, data.AgentStatus, event.ReceivedAt)
+		}
+	}()
+}
+
+func (b *Backend) unwatch(pane string) {
+	b.mu.Lock()
+	cancel := b.watching[pane]
+	b.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// Start resolves the job's agent, creating the workspace and launching the
+// harness when it is not already live. It is idempotent: an existing agent
+// with this job's name is adopted (restart adoption), never duplicated.
+func (b *Backend) Start(ctx context.Context, id string, l harnesses.Launch) (string, string, error) {
+	if len(l.Argv) == 0 {
+		return "", "", errors.New("empty harness argv")
+	}
+	name := AgentName(id)
+	harness := filepath.Base(l.Argv[0])
+	kind, ok := b.kind(harness)
+	if !ok {
+		return "", "", fmt.Errorf("harness %q not supported on herdr backend", harness)
+	}
+	var existing AgentInfo
+	var found bool
+	if err := b.call(ctx, func(c *Conn) error {
+		var e error
+		existing, found, e = c.AgentGet(ctx, name)
+		return e
+	}); err != nil {
+		return "", "", err
+	}
+	if found {
+		b.record(existing.PaneID, existing.AgentStatus, time.Now().UTC())
+		b.watch(existing.PaneID)
+		b.log().Info("adopted live herdr agent", "job", id, "agent", name, "pane", existing.PaneID)
+		return name, existing.PaneID, nil
+	}
+
+	args, prompt := splitPrompt(l)
+	env := launchEnv(l)
+	timeout := int(b.startupTimeout() / time.Millisecond)
+	var pane PaneInfo
+	err := b.call(ctx, func(c *Conn) error {
+		var e error
+		if _, pane, e = c.WorkspaceCreate(ctx, l.Dir, "golem/"+id, env); e != nil {
+			return e
+		}
+		if _, e = c.AgentStart(ctx, name, kind, pane.PaneID, args, timeout); e != nil {
+			return e
+		}
+		if prompt != "" {
+			return c.AgentPrompt(ctx, name, prompt)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("herdr start %s: %w", id, err)
+	}
+	b.record(pane.PaneID, "working", time.Now().UTC())
+	b.watch(pane.PaneID)
+	b.log().Info("herdr agent started", "job", id, "agent", name, "pane", pane.PaneID, "workspace", workspaceOf(pane.PaneID))
+	return name, pane.PaneID, nil
+}
+
+func (b *Backend) startupTimeout() time.Duration {
+	if b.StartupTimeout > 0 {
+		return b.StartupTimeout
+	}
+	return DefaultStartupTimeout
+}
+
+// splitPrompt separates the harness's initial task text from its argv. Herdr's
+// agent.start takes only args and waits for interactive readiness, so the
+// prompt is submitted afterwards through agent.prompt. The split happens only
+// when the final argv element is exactly the adapter's declared prompt;
+// otherwise argv is passed through untouched and nothing is submitted.
+func splitPrompt(l harnesses.Launch) ([]string, string) {
+	args := append([]string{}, l.Argv[1:]...)
+	if l.Prompt == "" || len(args) == 0 || args[len(args)-1] != l.Prompt {
+		return args, ""
+	}
+	return args[:len(args)-1], l.Prompt
+}
+
+// launchEnv is the environment for the workspace's root pane: the harness's
+// own environment plus a PATH that puts the operator-configured harness binary
+// first, because Herdr resolves the agent kind's executable through PATH.
+// Secrets ride here, never in argv.
+func launchEnv(l harnesses.Launch) map[string]string {
+	env := map[string]string{}
+	for k, v := range l.Env {
+		env[k] = v
+	}
+	if dir := filepath.Dir(l.Argv[0]); strings.Contains(l.Argv[0], string(os.PathSeparator)) {
+		env["PATH"] = dir + string(os.PathListSeparator) + os.Getenv("PATH")
+	} else if path := os.Getenv("PATH"); path != "" {
+		env["PATH"] = path
+	}
+	return env
+}
+
+func workspaceOf(pane string) string {
+	if id, _, ok := strings.Cut(pane, ":"); ok {
+		return id
+	}
+	return ""
+}
+
+// Has reports whether this job's agent is still live in the session.
+func (b *Backend) Has(ctx context.Context, session string) bool {
+	var found bool
+	err := b.call(ctx, func(c *Conn) error {
+		var e error
+		_, found, e = c.AgentGet(ctx, session)
+		return e
+	})
+	return err == nil && found
+}
+
+// Pane reports liveness of the job's agent. Herdr exposes no exit status
+// anywhere in the pane API (PR sketch B in the brief), so the exit code is
+// always nil: absence, not a status code, is the observable fact.
+func (b *Backend) Pane(ctx context.Context, target string) (bool, *int, error) {
+	var info AgentInfo
+	var found bool
+	err := b.call(ctx, func(c *Conn) error {
+		var e error
+		info, found, e = c.AgentGet(ctx, target)
+		return e
+	})
+	if err != nil {
+		return false, nil, err
+	}
+	if !found {
+		b.mu.Lock()
+		if status, ok := b.states[target]; ok {
+			status.Present, status.AsOf = false, time.Now().UTC()
+			b.states[target] = status
+		}
+		b.mu.Unlock()
+		return false, nil, nil
+	}
+	b.record(target, info.AgentStatus, time.Now().UTC())
+	return true, nil, nil
+}
+
+// Send delivers text to the agent as one atomic submitted message. Herdr
+// refuses agent.prompt while it believes the agent sits at an approval dialog;
+// Golem's answers are exactly the text that dialog is waiting for, so the
+// fallback types into the pane and presses Enter instead of giving up.
+func (b *Backend) Send(ctx context.Context, target, text string) error {
+	return b.call(ctx, func(c *Conn) error {
+		err := c.AgentPrompt(ctx, target, text)
+		if !IsCode(err, "agent_blocked") {
+			return err
+		}
+		b.log().Info("herdr agent blocked; delivering text through the pane", "pane", target)
+		if e := c.Call(ctx, "pane.send_text", map[string]any{"pane_id": target, "text": text}, nil); e != nil {
+			return e
+		}
+		return c.Call(ctx, "pane.send_keys", map[string]any{"pane_id": target, "keys": []string{"enter"}}, nil)
+	})
+}
+
+// Cancel is the verified cancellation path from §3.4: esc, ctrl+c, settle
+// briefly, close the workspace, then prove absence. A close response is not
+// itself evidence that descendants died, so an unverified cancel is reported
+// as an error rather than quietly claimed as success.
+func (b *Backend) Cancel(ctx context.Context, session, target string) error {
+	err := b.call(ctx, func(c *Conn) error {
+		if e := c.AgentSendKeys(ctx, session, "esc"); e != nil && !IsCode(e, "agent_not_found") {
+			return e
+		}
+		return nil
+	})
+	if err != nil {
+		b.log().Warn("herdr cancel esc failed", "agent", session, "error", err)
+	}
+	err = b.call(ctx, func(c *Conn) error {
+		if e := c.AgentSendKeys(ctx, session, "ctrl+c"); e != nil && !IsCode(e, "agent_not_found") {
+			return e
+		}
+		return nil
+	})
+	if err != nil {
+		b.log().Warn("herdr cancel interrupt failed", "agent", session, "error", err)
+	}
+	// Give the harness a moment to leave working state before the workspace
+	// goes away, so it can flush its own side channel.
+	select {
+	case <-ctx.Done():
+	case <-time.After(500 * time.Millisecond):
+	}
+	return b.Teardown(ctx, session, target)
+}
+
+// Teardown closes the job's workspace and verifies that both the agent and the
+// workspace are afterwards absent.
+func (b *Backend) Teardown(ctx context.Context, session, target string) error {
+	workspace := workspaceOf(target)
+	if workspace == "" {
+		return fmt.Errorf("herdr kill %s: no workspace in target %q", session, target)
+	}
+	b.unwatch(target)
+	if err := b.call(ctx, func(c *Conn) error { return c.WorkspaceClose(ctx, workspace) }); err != nil {
+		return fmt.Errorf("herdr workspace.close %s: %w", workspace, err)
+	}
+	var agentGone, workspaceGone bool
+	err := b.call(ctx, func(c *Conn) error {
+		_, found, e := c.AgentGet(ctx, session)
+		if e != nil {
+			return e
+		}
+		agentGone = !found
+		_, wsFound, e := c.WorkspaceGet(ctx, workspace)
+		if e != nil {
+			return e
+		}
+		workspaceGone = !wsFound
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("herdr teardown verification %s: %w", session, err)
+	}
+	if !agentGone || !workspaceGone {
+		return fmt.Errorf("herdr teardown unverified for %s: agent_present=%t workspace_present=%t", session, !agentGone, !workspaceGone)
+	}
+	b.mu.Lock()
+	delete(b.states, target)
+	b.mu.Unlock()
+	return nil
+}
+
+// ServerAlive pings the session socket.
+func (b *Backend) ServerAlive(ctx context.Context) bool {
+	err := b.call(ctx, func(c *Conn) error {
+		_, _, e := c.Ping(ctx)
+		return e
+	})
+	return err == nil
+}
+
+// Shutdown does nothing on purpose. The Herdr server is one per host, shared,
+// and not golemd's to stop: killing it would take every job on the host with
+// it. Live agents survive a golemd restart and are re-adopted by name.
+func (b *Backend) Shutdown(context.Context) error {
+	b.mu.Lock()
+	c := b.ctrl
+	b.ctrl = nil
+	b.mu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
+	return nil
+}
+
+// Endpoint publishes no host-local terminal: reaching a job is ordinary SSH
+// plus herdr, not a tmux socket Golem hands out.
+func (b *Backend) Endpoint(string, string) *protocol.TerminalEndpoint { return nil }
+
+// Policy restricts this substrate to pi and disables attach and steer, which
+// the API reports as 501 rather than pretending they work.
+func (b *Backend) Policy() backend.Policy {
+	harnesses := map[string]bool{}
+	kinds := b.Kinds
+	if len(kinds) == 0 {
+		kinds = map[string]string{"pi": "pi"}
+	}
+	for golem := range kinds {
+		harnesses[golem] = true
+	}
+	return backend.Policy{Name: "herdr", Harnesses: harnesses, NoAttach: true, NoSteer: true}
+}
+
+var (
+	_ backend.Backend  = (*Backend)(nil)
+	_ backend.Observer = (*Backend)(nil)
+)

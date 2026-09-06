@@ -365,8 +365,9 @@ func (a Adapter) Start(_ context.Context, j protocol.Job) (harnesses.Launch, err
 	if m := j.Model; m != "" {
 		v = append(v, "--model", m)
 	}
-	v = append(v, withBlockSuffix(j.Prompt))
-	return harnesses.Launch{Argv: v, Dir: j.CWD, Env: a.launchEnv(ev, wd, taskContext), Transcript: t, Session: s, Events: ev, Interactive: true}, nil
+	prompt := withBlockSuffix(j.Prompt)
+	v = append(v, prompt)
+	return harnesses.Launch{Argv: v, Dir: j.CWD, Env: a.launchEnv(ev, wd, taskContext), Transcript: t, Session: s, Events: ev, Interactive: true, Prompt: prompt}, nil
 }
 
 func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (harnesses.Launch, error) {
@@ -388,7 +389,8 @@ func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (
 	if m := j.Model; m != "" {
 		l.Argv = append(l.Argv, "--model", m)
 	}
-	l.Argv = append(l.Argv, "Continue the interrupted delegated task from the existing session.")
+	l.Prompt = "Continue the interrupted delegated task from the existing session."
+	l.Argv = append(l.Argv, l.Prompt)
 	l.Env = a.launchEnv(l.Events, wd, taskContext)
 	l.Interactive = true
 	return l, nil
