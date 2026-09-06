@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import {
+  isInferenceApi,
   catalogToProviderGroups,
   isCatalog,
   normalizeBaseUrl,
@@ -34,7 +35,14 @@ export default async function tiamat(pi: ExtensionAPI) {
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) throw new Error(`Golem Tiamat catalog returned HTTP ${response.status}`);
-  const catalog: unknown = await response.json();
+  const raw: unknown = await response.json();
+  // Records for wires this extension doesn't speak (the router grew a speech
+  // family; more may follow) are not an invalid catalogue — they're just not
+  // for pi. Drop them before validating, so an unknown api can never take
+  // dispatch down.
+  const catalog: unknown = Array.isArray(raw)
+    ? raw.filter((record) => record && typeof record === "object" && isInferenceApi((record as { api?: unknown }).api))
+    : raw;
   if (!isCatalog(catalog)) throw new Error("Golem Tiamat catalog response has an invalid shape");
 
   // Pi resolves this command for each request. The token itself therefore

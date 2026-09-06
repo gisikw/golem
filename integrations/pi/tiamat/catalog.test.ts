@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   catalogToProviderGroups,
+  isInferenceApi,
   etagRequiresFetch,
   withoutMaxOutputTokens,
   type TiamatCatalogRecord,
@@ -91,4 +92,12 @@ describe("ETag polling", () => {
     expect(etagRequiresFetch(200, '"old"', null)).toBe(true);
     expect(etagRequiresFetch(500, '"old"', '"new"')).toBe(false);
   });
+});
+
+test("isInferenceApi admits the three inference wires and nothing else", () => {
+  expect(isInferenceApi("/openai/v1/chat/completions")).toBe(true);
+  expect(isInferenceApi("/anthropic/v1/messages")).toBe(true);
+  expect(isInferenceApi("/responses/v1/responses")).toBe(true);
+  expect(isInferenceApi("/speech/v1/audio/speech")).toBe(false);
+  expect(isInferenceApi(undefined)).toBe(false);
 });

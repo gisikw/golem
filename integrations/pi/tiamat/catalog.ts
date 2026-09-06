@@ -126,3 +126,8 @@ export function withoutMaxOutputTokens(payload: unknown): unknown {
   const { max_output_tokens: _unsupported, ...rest } = payload as Record<string, unknown>;
   return rest;
 }
+
+/** Whether a catalogue record's `api` is one of the inference wires pi speaks. */
+export function isInferenceApi(api: unknown): api is TiamatCatalogRecord["api"] {
+  return typeof api === "string" && api in WIRES;
+}
