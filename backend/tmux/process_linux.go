@@ -1,6 +1,6 @@
 //go:build linux
 
-package supervisor
+package tmux
 
 import (
 	"os/exec"

@@ -1,4 +1,8 @@
-package supervisor
+// Package tmux is Golem's original run substrate: a private tmux server, its
+// pinned policy file, and the pane/keystroke operations the supervisor uses.
+// It was moved here verbatim from supervisor/tmux.go when backend.Backend was
+// introduced; the tmux behaviour itself is unchanged.
+package tmux
 
 import (
 	"bytes"

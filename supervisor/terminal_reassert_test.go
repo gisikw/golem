@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	tmuxbackend "github.com/gisikw/golem/backend/tmux"
 	"github.com/gisikw/golem/client"
 	"github.com/gisikw/golem/harnesses"
 	"github.com/gisikw/golem/harnesses/claude"
@@ -26,11 +27,11 @@ func liveSupervisor(t *testing.T) (*Supervisor, *service.Store, string) {
 	cwd := t.TempDir()
 	s, store, _ := testSupervisor(t, cwd, t.TempDir())
 	s.Adapters = map[string]harnesses.Adapter{"fake": claude.Adapter{ArgvTemplate: []string{"sh", "-c", "sleep 30"}}}
-	s.Tmux = Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
-	if err := s.Tmux.Prepare(); err != nil {
+	s.Backend = tmuxbackend.Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
+	if err := s.tmux().Prepare(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = s.Tmux.run(context.Background(), "kill-server") })
+	t.Cleanup(func() { _, _ = s.tmux().Run(context.Background(), "kill-server") })
 	return s, store, cwd
 }
 
@@ -76,7 +77,7 @@ func TestTerminalEndpointReassertedAfterLostStartingEvent(t *testing.T) {
 	}
 	httpServer := httptest.NewServer(service.API{Store: store, Capabilities: protocol.Capabilities{Name: "host", Harnesses: map[string]protocol.HarnessCapability{"fake": {}}}}.Handler())
 	defer httpServer.Close()
-	s2 := &Supervisor{Host: "host", Client: client.New(httpServer.URL), Registry: reg2, Tmux: s.Tmux, ArtifactRoot: s.ArtifactRoot, AllowedCWDRoots: []string{cwd}, Adapters: s.Adapters, MaxStartAttempts: 2, StartBackoff: time.Nanosecond}
+	s2 := &Supervisor{Host: "host", Client: client.New(httpServer.URL), Registry: reg2, Backend: s.Backend, ArtifactRoot: s.ArtifactRoot, AllowedCWDRoots: []string{cwd}, Adapters: s.Adapters, MaxStartAttempts: 2, StartBackoff: time.Nanosecond}
 
 	for i := 0; i < 3; i++ {
 		if e := s2.Tick(ctx); e != nil {
@@ -92,9 +93,9 @@ func TestTerminalEndpointReassertedAfterLostStartingEvent(t *testing.T) {
 	if got.Terminal == nil {
 		t.Fatal("live worker never regained a terminal endpoint: row stays nonclickable")
 	}
-	wantTarget := "worker-" + safeName.ReplaceAllString(job.ID, "-") + ":0.0"
-	if got.Terminal.Host != "host" || got.Terminal.Socket != s.Tmux.Socket || got.Terminal.Target != wantTarget {
-		t.Fatalf("reasserted endpoint not exact: %#v (want socket=%q target=%q)", got.Terminal, s.Tmux.Socket, wantTarget)
+	wantTarget := "worker-" + tmuxbackend.SafeName(job.ID) + ":0.0"
+	if got.Terminal.Host != "host" || got.Terminal.Socket != s.tmux().Socket || got.Terminal.Target != wantTarget {
+		t.Fatalf("reasserted endpoint not exact: %#v (want socket=%q target=%q)", got.Terminal, s.tmux().Socket, wantTarget)
 	}
 }
 
@@ -121,10 +122,10 @@ func TestDeadWorkerGetsNoTerminalReassertion(t *testing.T) {
 	}
 
 	// Kill the tmux session: the terminal is now dead/stale.
-	if err = s.Tmux.Kill(ctx, w.Session); err != nil {
+	if err = s.tmux().Kill(ctx, w.Session); err != nil {
 		t.Fatalf("kill session: %v", err)
 	}
-	if s.Tmux.Has(ctx, w.Session) {
+	if s.tmux().Has(ctx, w.Session) {
 		t.Fatal("session still alive after kill")
 	}
 

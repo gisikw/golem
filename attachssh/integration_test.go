@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	tmuxbackend "github.com/gisikw/golem/backend/tmux"
 	"github.com/gisikw/golem/harnesses"
 	"github.com/gisikw/golem/protocol"
 	"github.com/gisikw/golem/supervisor"
@@ -22,7 +23,7 @@ func TestSSHAttachIntegration(t *testing.T) {
 		t.Skip("tmux absent")
 	}
 	dir := t.TempDir()
-	tmux := supervisor.Tmux{Socket: filepath.Join(dir, "tmux.sock")}
+	tmux := tmuxbackend.Tmux{Socket: filepath.Join(dir, "tmux.sock")}
 	if err := tmux.Prepare(); err != nil {
 		t.Fatal(err)
 	}

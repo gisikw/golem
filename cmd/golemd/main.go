@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/gisikw/golem/attachssh"
+	"github.com/gisikw/golem/backend"
+	tmuxbackend "github.com/gisikw/golem/backend/tmux"
 	"github.com/gisikw/golem/client"
 	golemconfig "github.com/gisikw/golem/config"
 	piadapter "github.com/gisikw/golem/harnesses/pi"
@@ -168,14 +170,15 @@ func main() {
 		slog.Error("registry", "error", err)
 		os.Exit(1)
 	}
-	tmux := supervisor.Tmux{Socket: filepath.Join(*state, "tmux.sock"), Config: filepath.Join(*state, "tmux.conf"), DefaultShell: os.Getenv("GOLEM_INTERACTIVE_SHELL")}
-	if err = tmux.Prepare(); err != nil {
+	tmuxBackend := tmuxbackend.Tmux{Socket: filepath.Join(*state, "tmux.sock"), Config: filepath.Join(*state, "tmux.conf"), DefaultShell: os.Getenv("GOLEM_INTERACTIVE_SHELL")}
+	if err = tmuxBackend.Prepare(); err != nil {
 		slog.Error("tmux prepare", "error", err)
 		os.Exit(1)
 	}
-	if err = tmux.ReapplyPolicy(context.Background()); err != nil {
+	if err = tmuxBackend.ReapplyPolicy(context.Background()); err != nil {
 		slog.Warn("tmux policy reapply on boot failed", "error", err)
 	}
+	var runBackend backend.Backend = tmuxBackend
 	roots := strings.Split(*allowedRoots, string(os.PathListSeparator))
 	for _, project := range cfg.Projects {
 		roots = append(roots, project.Path)
@@ -189,7 +192,7 @@ func main() {
 	if *socket == "" && len(cfg.APIBearerTokens) > 0 {
 		internalClient.Token = cfg.APIBearerTokens[0]
 	}
-	sup := &supervisor.Supervisor{Host: cfg.Name, Client: internalClient, Registry: registry, Tmux: tmux, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters, AttachHost: cfg.Name, AttachPort: cfg.AttachSSH.Port}
+	sup := &supervisor.Supervisor{Host: cfg.Name, Client: internalClient, Registry: registry, Backend: runBackend, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters, AttachHost: cfg.Name, AttachPort: cfg.AttachSSH.Port}
 
 	var sshServer *attachssh.Server
 	if cfg.AttachSSH.Port != 0 {
@@ -208,7 +211,7 @@ func main() {
 			slog.Error("SSH attach listen", "error", listenErr)
 			os.Exit(1)
 		}
-		sshServer = attachssh.New(registry, tmux, hostSigner, authorized)
+		sshServer = attachssh.New(registry, tmuxBackend, hostSigner, authorized)
 		go func() {
 			slog.Info("listening", "component", "attach-ssh", "address", sshListener.Addr())
 			if serveErr := sshServer.Serve(sshListener); serveErr != nil && !errors.Is(serveErr, gliderssh.ErrServerClosed) {
@@ -228,7 +231,7 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			shutdownDaemon(servers, sshServer, tmux)
+			shutdownDaemon(servers, sshServer, runBackend)
 			return
 		case <-ticker.C:
 			if err = sup.Tick(ctx); err != nil && ctx.Err() == nil {
@@ -244,7 +247,7 @@ func main() {
 // deliberately untouched: boot reconciliation either resumes a capable
 // adapter or records a vanished non-resumable worker as failed; shutdown never
 // fabricates successful completion.
-func shutdownDaemon(servers []*http.Server, sshServer *attachssh.Server, tmux supervisor.Tmux) {
+func shutdownDaemon(servers []*http.Server, sshServer *attachssh.Server, runBackend backend.Backend) {
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	for _, server := range servers {
 		if err := server.Shutdown(shutdown); err != nil {
@@ -261,8 +264,8 @@ func shutdownDaemon(servers []*http.Server, sshServer *attachssh.Server, tmux su
 	// Use a fresh bound so a slow HTTP drain cannot prevent worker teardown.
 	killCtx, killCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer killCancel()
-	if err := tmux.KillServer(killCtx); err != nil {
-		slog.Error("private tmux shutdown failed", "error", err)
+	if err := runBackend.Shutdown(killCtx); err != nil {
+		slog.Error("run backend shutdown failed", "error", err)
 	}
 }
 

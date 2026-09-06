@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	tmuxbackend "github.com/gisikw/golem/backend/tmux"
 	"github.com/gisikw/golem/client"
 	"github.com/gisikw/golem/harnesses"
 	piadapter "github.com/gisikw/golem/harnesses/pi"
@@ -44,11 +45,11 @@ func TestTickDeliversPersistedSteersInOrder(t *testing.T) {
 	defer cancel()
 	cwd, artifacts := t.TempDir(), t.TempDir()
 	s, store, _ := testSupervisor(t, cwd, artifacts)
-	s.Tmux = Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
-	if err := s.Tmux.Prepare(); err != nil {
+	s.Backend = tmuxbackend.Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
+	if err := s.tmux().Prepare(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = s.Tmux.run(context.Background(), "kill-server") })
+	t.Cleanup(func() { _, _ = s.tmux().Run(context.Background(), "kill-server") })
 	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "steer-order", Harness: "fake", Host: "host", Prompt: "go", CWD: cwd})
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +61,7 @@ func TestTickDeliversPersistedSteersInOrder(t *testing.T) {
 	}
 	job, _ = store.Get(ctx, job.ID)
 	launch := harnesses.Launch{Argv: []string{"bash", "--noprofile", "--norc"}, Dir: cwd, Interactive: true}
-	session, target, err := s.Tmux.Start(ctx, job.ID, launch)
+	session, target, err := s.tmux().Start(ctx, job.ID, launch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,11 +101,11 @@ func TestPiSideChannelCompletionSettlesWhileTUIIsAlive(t *testing.T) {
 	defer cancel()
 	cwd, artifacts := t.TempDir(), t.TempDir()
 	s, store, _ := testSupervisor(t, cwd, artifacts)
-	s.Tmux = Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
-	if err := s.Tmux.Prepare(); err != nil {
+	s.Backend = tmuxbackend.Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
+	if err := s.tmux().Prepare(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = s.Tmux.run(context.Background(), "kill-server") })
+	t.Cleanup(func() { _, _ = s.tmux().Run(context.Background(), "kill-server") })
 	s.Adapters["pi"] = piadapter.Adapter{}
 	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "pi-side", Harness: "pi", Host: "host", Prompt: "go", CWD: cwd})
 	if err != nil {
@@ -119,7 +120,7 @@ func TestPiSideChannelCompletionSettlesWhileTUIIsAlive(t *testing.T) {
 	}
 	events := filepath.Join(job.Artifacts.Directory, "events.jsonl")
 	launch := harnesses.Launch{Argv: []string{"sh", "-c", "sleep 30"}, Dir: cwd, Events: events, Interactive: true}
-	session, target, err := s.Tmux.Start(ctx, job.ID, launch)
+	session, target, err := s.tmux().Start(ctx, job.ID, launch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +138,7 @@ func TestPiSideChannelCompletionSettlesWhileTUIIsAlive(t *testing.T) {
 	if err != nil || got.State != protocol.Done || got.Settlement == nil || got.Settlement.Summary != "finished" {
 		t.Fatalf("pi completion did not propagate: %#v %v", got, err)
 	}
-	alive, _, err := s.Tmux.Pane(ctx, target)
+	alive, _, err := s.tmux().Pane(ctx, target)
 	if err != nil || !alive {
 		t.Fatalf("interactive pane should still be alive at side-channel settlement: %v %v", alive, err)
 	}
@@ -152,11 +153,11 @@ func TestFakeWorkerOutputIsVisibleCapturedAndSettled(t *testing.T) {
 	cwd := t.TempDir()
 	artifacts := t.TempDir()
 	s, store, c := testSupervisor(t, cwd, artifacts)
-	s.Tmux = Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
-	if err := s.Tmux.Prepare(); err != nil {
+	s.Backend = tmuxbackend.Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
+	if err := s.tmux().Prepare(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = s.Tmux.run(context.Background(), "kill-server") })
+	t.Cleanup(func() { _, _ = s.tmux().Run(context.Background(), "kill-server") })
 	job, err := c.Create(ctx, protocol.CreateJob{IdempotencyKey: "fake-live", Harness: "fake", Host: "host", Prompt: "go", CWD: cwd})
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +183,7 @@ func TestFakeWorkerOutputIsVisibleCapturedAndSettled(t *testing.T) {
 	if got.Settlement.ExitStatus == nil || *got.Settlement.ExitStatus != 0 || len(got.Settlement.Artifacts) == 0 {
 		t.Fatalf("fake settlement lacks exit status/artifact listing: %#v", got.Settlement)
 	}
-	pane, err := s.Tmux.run(ctx, "capture-pane", "-p", "-S", "-", "-t", worker.Target)
+	pane, err := s.tmux().Run(ctx, "capture-pane", "-p", "-S", "-", "-t", worker.Target)
 	if err != nil || !strings.Contains(pane, "fake-worker-complete") {
 		t.Fatalf("fake worker output not visible in pane: %q %v", pane, err)
 	}
@@ -197,8 +198,8 @@ func TestBootReconciliationFailsVanishedNonResumableWorker(t *testing.T) {
 	defer cancel()
 	cwd, artifactRoot := t.TempDir(), t.TempDir()
 	s, store, c := testSupervisor(t, cwd, artifactRoot)
-	s.Tmux = Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
-	if err := s.Tmux.Prepare(); err != nil {
+	s.Backend = tmuxbackend.Tmux{Socket: filepath.Join(t.TempDir(), "tmux.sock")}
+	if err := s.tmux().Prepare(); err != nil {
 		t.Fatal(err)
 	}
 	job, err := c.Create(ctx, protocol.CreateJob{IdempotencyKey: "boot-missing", Harness: "fake", Host: "host", Prompt: "go", CWD: cwd})

@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	"github.com/creack/pty"
+	tmuxbackend "github.com/gisikw/golem/backend/tmux"
 	"github.com/gisikw/golem/supervisor"
 	gliderssh "github.com/gliderlabs/ssh"
 	gossh "golang.org/x/crypto/ssh"
@@ -27,7 +28,7 @@ import (
 
 type Server struct {
 	Registry *supervisor.Registry
-	Tmux     supervisor.Tmux
+	Tmux     tmuxbackend.Tmux
 	server   *gliderssh.Server
 }
 
@@ -119,7 +120,7 @@ func ResolveUsername(user string, workers map[string]supervisor.Worker) (supervi
 	}
 }
 
-func New(registry *supervisor.Registry, tmux supervisor.Tmux, signer gossh.Signer, authorized []gossh.PublicKey) *Server {
+func New(registry *supervisor.Registry, tmux tmuxbackend.Tmux, signer gossh.Signer, authorized []gossh.PublicKey) *Server {
 	s := &Server{Registry: registry, Tmux: tmux}
 	allowed := func(key gossh.PublicKey) bool {
 		for _, candidate := range authorized {

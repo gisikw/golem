@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gisikw/golem/artifacts"
+	"github.com/gisikw/golem/backend"
 	"github.com/gisikw/golem/client"
 	"github.com/gisikw/golem/harnesses"
 	"github.com/gisikw/golem/harnesses/claude"
@@ -60,7 +61,7 @@ type Supervisor struct {
 	Host             string
 	Client           *client.Client
 	Registry         *Registry
-	Tmux             Tmux
+	Backend          backend.Backend
 	OfflineWindow    time.Duration
 	ArtifactRoot     string
 	AllowedCWDRoots  []string
@@ -105,7 +106,7 @@ func (s *Supervisor) Recover(ctx context.Context) {
 		if !w.SettledAt.IsZero() {
 			continue
 		}
-		if s.Tmux.Has(ctx, w.Session) {
+		if s.Backend.Has(ctx, w.Session) {
 			continue
 		}
 		if time.Now().After(w.RestartUntil) {
@@ -125,7 +126,7 @@ func (s *Supervisor) resumeWorker(ctx context.Context, w Worker, mode string) {
 		s.log().Warn("worker cannot resume", "job", w.Job.ID, "mode", mode, "error", err)
 		return
 	}
-	session, target, err := s.Tmux.Start(ctx, w.Job.ID, launch)
+	session, target, err := s.Backend.Start(ctx, w.Job.ID, launch)
 	if err != nil {
 		s.log().Error("worker resume failed", "job", w.Job.ID, "mode", mode, "error", err)
 		return
@@ -149,11 +150,11 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 	local := s.Registry.Snapshot()
 	for _, d := range poll.Assignments {
 		if w, ok := local[d.Job.ID]; ok && d.Job.ReapRequested && !w.SettledAt.IsZero() {
-			_ = s.Tmux.Kill(ctx, w.Session)
+			_ = s.Backend.Kill(ctx, w.Session)
 			_ = s.Registry.Delete(d.Job.ID)
 			continue
 		}
-		if w, ok := local[d.Job.ID]; ok && w.SettledAt.IsZero() && !s.Tmux.Has(ctx, w.Session) && d.DesiredState != protocol.Cancelling {
+		if w, ok := local[d.Job.ID]; ok && w.SettledAt.IsZero() && !s.Backend.Has(ctx, w.Session) && d.DesiredState != protocol.Cancelling {
 			s.resumeWorker(ctx, w, "confirmed")
 		}
 	}
@@ -320,7 +321,7 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 		launch.Env = map[string]string{}
 	}
 	launch.Env["GOLEM_ARTIFACT_DIR"] = j.Artifacts.Directory
-	session, target, err := s.Tmux.Start(ctx, j.ID, launch)
+	session, target, err := s.Backend.Start(ctx, j.ID, launch)
 	if err != nil {
 		return err
 	}
@@ -335,10 +336,29 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 	}
 	return nil
 }
+
+// observedAt is the honest timestamp for a state observation. tmux state is
+// read synchronously, so it is simply now. A substrate that watches state
+// asynchronously (herdr, whose events carry no timestamp of their own) reports
+// when golemd received the observation; never a backdated guess about when the
+// transition actually happened.
+func (s *Supervisor) observedAt(target string) time.Time {
+	now := time.Now().UTC()
+	observer, ok := s.Backend.(backend.Observer)
+	if !ok || target == "" {
+		return now
+	}
+	status, found := observer.Status(target)
+	if !found || status.AsOf.IsZero() || status.AsOf.After(now) {
+		return now
+	}
+	return status.AsOf.UTC()
+}
+
 func (s *Supervisor) publishState(ctx context.Context, w *Worker, state protocol.State) error {
-	event := protocol.ObservedEvent{ID: w.Job.ID + "-" + string(state), JobID: w.Job.ID, State: state, ObservedAt: time.Now().UTC()}
+	event := protocol.ObservedEvent{ID: w.Job.ID + "-" + string(state), JobID: w.Job.ID, State: state, ObservedAt: s.observedAt(w.Target)}
 	if state == protocol.Starting || state == protocol.Running {
-		event.Terminal = &protocol.TerminalEndpoint{Host: s.Host, Socket: s.Tmux.Socket, Target: w.Target}
+		event.Terminal = s.Backend.Endpoint(s.Host, w.Target)
 		if s.AttachPort > 0 {
 			host := s.AttachHost
 			if host == "" {
@@ -381,7 +401,11 @@ func (s *Supervisor) reassertTerminal(ctx context.Context, job protocol.Job) {
 	if w.LastState == protocol.Starting {
 		return
 	}
-	want := protocol.TerminalEndpoint{Host: s.Host, Socket: s.Tmux.Socket, Target: w.Target}
+	endpoint := s.Backend.Endpoint(s.Host, w.Target)
+	if endpoint == nil {
+		return // this substrate publishes no host-local terminal (herdr)
+	}
+	want := *endpoint
 	var activation *protocol.Activation
 	if s.AttachPort > 0 {
 		host := s.AttachHost
@@ -393,7 +417,7 @@ func (s *Supervisor) reassertTerminal(ctx context.Context, job protocol.Job) {
 	if job.Terminal != nil && *job.Terminal == want && (activation == nil || job.Activation != nil && *job.Activation == *activation) {
 		return
 	}
-	if !s.Tmux.Has(ctx, w.Session) {
+	if !s.Backend.Has(ctx, w.Session) {
 		return // no live terminal exists; never fabricate a target
 	}
 	eventID := job.ID + "-terminal"
@@ -417,11 +441,11 @@ func (s *Supervisor) publishBlocked(ctx context.Context, w *Worker, q *protocol.
 	return s.Registry.Put(*w)
 }
 func (s *Supervisor) sendText(ctx context.Context, w Worker, text string) error {
-	return s.Tmux.Send(ctx, w.Target, text)
+	return s.Backend.Send(ctx, w.Target, text)
 }
 
 func (s *Supervisor) runtime(w Worker) harnesses.Runtime {
-	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }, Cancel: func(ctx context.Context) error { return s.Tmux.Kill(ctx, w.Session) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Tmux.Pane(ctx, w.Target) }}
+	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }, Cancel: func(ctx context.Context) error { return s.Backend.Kill(ctx, w.Session) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Backend.Pane(ctx, w.Target) }}
 }
 func (s *Supervisor) reapExpired(ctx context.Context, now time.Time) {
 	linger := s.Linger
@@ -430,7 +454,7 @@ func (s *Supervisor) reapExpired(ctx context.Context, now time.Time) {
 	}
 	for id, w := range s.Registry.Snapshot() {
 		if !w.SettledAt.IsZero() && now.Sub(w.SettledAt) >= linger {
-			_ = s.Tmux.Kill(ctx, w.Session)
+			_ = s.Backend.Kill(ctx, w.Session)
 			_ = s.Registry.Delete(id)
 		}
 	}
@@ -449,7 +473,9 @@ func (s *Supervisor) cancel(ctx context.Context, id string) {
 	}
 	// Ctrl-C lets the worker pane become a retained dead pane under the owned
 	// tmux policy, preserving its output for the linger window.
-	_ = s.Tmux.Interrupt(ctx, w.Target)
+	if err := s.Backend.Cancel(ctx, w.Session, w.Target); err != nil {
+		s.log().Warn("backend cancel incomplete", "job", id, "error", err)
+	}
 	set := protocol.Settlement{ID: id + "-cancelled", JobID: id, State: protocol.Cancelled, Verdict: protocol.Cancelled, Summary: "cancelled by requested state", At: time.Now().UTC()}
 	if err := s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{{ID: id + "-cancel-settlement", JobID: id, Settlement: &set}}}); err == nil {
 		s.settleWorker(w, set.At, set.State)
@@ -457,7 +483,7 @@ func (s *Supervisor) cancel(ctx context.Context, id string) {
 }
 func (s *Supervisor) forget(ctx context.Context, id string) {
 	if w, ok := s.Registry.Snapshot()[id]; ok {
-		_ = s.Tmux.Kill(ctx, w.Session)
+		_ = s.Backend.Kill(ctx, w.Session)
 		_ = s.Registry.Delete(id)
 	}
 }
@@ -531,9 +557,14 @@ func (s *Supervisor) observe(ctx context.Context) error {
 				return ctx.Err()
 			}
 			one := 1
+			name := s.Backend.Policy().Name
 			boundary := "worker tmux target unavailable"
-			if !s.Tmux.ServerAlive(ctx) {
-				boundary = "private tmux server unavailable"
+			serverBoundary := "private tmux server unavailable"
+			if name != "" && name != "tmux" {
+				boundary, serverBoundary = "worker "+name+" target unavailable", name+" substrate unavailable"
+			}
+			if !s.Backend.ServerAlive(ctx) {
+				boundary = serverBoundary
 			}
 			obs = harnesses.Observation{State: protocol.Failed, ExitCode: &one}
 			detail, _ := json.Marshal(map[string]string{"failure_boundary": boundary})
@@ -555,7 +586,7 @@ func (s *Supervisor) observe(ctx context.Context) error {
 		if obs.Terminate {
 			// Policy exhaustion is an immediate process boundary, not ordinary
 			// settlement linger. The artifacts/session remain retained by Golem.
-			if killErr := s.Tmux.Kill(ctx, w.Session); killErr != nil {
+			if killErr := s.Backend.Kill(ctx, w.Session); killErr != nil {
 				s.log().Warn("exhausted worker kill failed", "job", id, "error", killErr)
 			}
 		}
