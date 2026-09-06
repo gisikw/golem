@@ -53,6 +53,10 @@ type Herdr struct {
 	StartupTimeoutMS int `toml:"startup_timeout_ms"`
 	// ReconcileInterval is the safety-net poll (Go duration, default 15s).
 	ReconcileInterval string `toml:"reconcile_interval"`
+	// PiExtension is the operator-owned herdr-agent-state.ts installed into a
+	// stable seed profile. Golem copies its bytes into each Herdr-backed Pi
+	// worker profile; Herdr never writes job-private profiles itself.
+	PiExtension string `toml:"pi_extension"`
 	// Kinds maps a Golem harness to a Herdr agent kind. Default {pi = "pi"};
 	// every other harness is rejected at dispatch with 400.
 	Kinds map[string]string `toml:"kinds"`
@@ -194,6 +198,33 @@ func Load(path string) (Config, error) {
 		for golem, kind := range c.Herdr.Kinds {
 			if golem == "" || kind == "" {
 				return Config{}, errors.New("herdr.kinds entries must be non-empty")
+			}
+		}
+		_, piConfigured := c.Harnesses["pi"]
+		_, piMapped := c.Herdr.Kinds["pi"]
+		if len(c.Herdr.Kinds) == 0 {
+			piMapped = true // backend/herdr's default mapping is pi -> pi.
+		}
+		if piConfigured && piMapped {
+			if c.Herdr.PiExtension == "" {
+				return Config{}, errors.New("herdr.pi_extension is required when Herdr-backed Pi is configured")
+			}
+			if !filepath.IsAbs(c.Herdr.PiExtension) {
+				return Config{}, errors.New("herdr.pi_extension must be an absolute path")
+			}
+			info, statErr := os.Stat(c.Herdr.PiExtension)
+			if statErr != nil {
+				return Config{}, fmt.Errorf("herdr.pi_extension: %w", statErr)
+			}
+			if !info.Mode().IsRegular() {
+				return Config{}, errors.New("herdr.pi_extension must be a regular file")
+			}
+			f, openErr := os.Open(c.Herdr.PiExtension)
+			if openErr != nil {
+				return Config{}, fmt.Errorf("herdr.pi_extension is not readable: %w", openErr)
+			}
+			if closeErr := f.Close(); closeErr != nil {
+				return Config{}, fmt.Errorf("herdr.pi_extension: %w", closeErr)
 			}
 		}
 	}

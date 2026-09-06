@@ -3,9 +3,11 @@ package pi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gisikw/golem/harnesses"
@@ -72,7 +74,7 @@ func TestStartLaunchesInteractiveTUIWithSideChannel(t *testing.T) {
 // worker extension set (agent-hooks + optional web) and never the operator's
 // worklist/identity/attention/zip/handoff/agents-dispatch/subscriber/telemetry
 // suite. This guards against future profile leakage.
-func TestWorkerSettingsContainsOnlyExpectedExtensions(t *testing.T) {
+func TestDefaultTmuxWorkerSettingsContainsOnlyExpectedExtensions(t *testing.T) {
 	dir := t.TempDir()
 	// A source profile carrying the operator's full (dangerous) extension list
 	// plus model defaults. The adapter must read ONLY the model defaults from it.
@@ -133,6 +135,121 @@ func TestWorkerSettingsContainsOnlyExpectedExtensions(t *testing.T) {
 	// Auth is NOT copied by default (secrets stay out of per-job artifact dirs).
 	if _, err = os.Stat(filepath.Join(dir, "pi", "auth.json")); !os.IsNotExist(err) {
 		t.Fatalf("auth.json copied without opt-in: %v", err)
+	}
+}
+
+func TestHerdrWorkerCopiesLifecycleExtensionIntoPrivateAllowlist(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "seed", "extensions", "herdr-agent-state.ts")
+	if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := []byte("// installed by Herdr\nexport default function extension() {}\n")
+	if err := os.WriteFile(source, wantBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := Adapter{Binary: "pi", HookExtension: "/extensions/golem-hooks", WebExtension: "/extensions/golem-web", HerdrExtension: source}
+	jobDir := filepath.Join(root, "job-a")
+	j := protocol.Job{ID: "a", CWD: root, Prompt: "go", Artifacts: protocol.ArtifactMetadata{Directory: jobDir}}
+	launch, err := a.Start(context.Background(), j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privatePath := filepath.Join(jobDir, "pi", "extensions", "herdr-agent-state.ts")
+	if privatePath == source || launch.Env[CodingDirEnv] != filepath.Join(jobDir, "pi") {
+		t.Fatalf("Herdr extension/profile is not job-private: source=%q destination=%q env=%q", source, privatePath, launch.Env[CodingDirEnv])
+	}
+	gotBytes, err := os.ReadFile(privatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotBytes) != string(wantBytes) {
+		t.Fatalf("Herdr extension bytes changed during copy:\n got %q\nwant %q", gotBytes, wantBytes)
+	}
+	info, err := os.Stat(privatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("private extension mode = %v; want 0600", info.Mode().Perm())
+	}
+	settingsBytes, err := os.ReadFile(filepath.Join(jobDir, "pi", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Extensions []string `json:"extensions"`
+	}
+	if err = json.Unmarshal(settingsBytes, &settings); err != nil {
+		t.Fatal(err)
+	}
+	wantExtensions := []string{"/extensions/golem-hooks", "/extensions/golem-web", privatePath}
+	if len(settings.Extensions) != len(wantExtensions) {
+		t.Fatalf("extension allowlist %v, want %v", settings.Extensions, wantExtensions)
+	}
+	for i := range wantExtensions {
+		if settings.Extensions[i] != wantExtensions[i] {
+			t.Fatalf("extension allowlist %v, want %v", settings.Extensions, wantExtensions)
+		}
+	}
+	if strings.Contains(string(settingsBytes), source) {
+		t.Fatalf("settings references shared seed extension: %s", settingsBytes)
+	}
+}
+
+func TestHerdrWorkerFailsClearlyWhenExtensionSourceDisappears(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "seed", "extensions", "herdr-agent-state.ts")
+	a := Adapter{Binary: "pi", HerdrExtension: source}
+	j := protocol.Job{ID: "missing", CWD: root, Prompt: "go", Artifacts: protocol.ArtifactMetadata{Directory: filepath.Join(root, "job")}}
+	_, err := a.Start(context.Background(), j)
+	if err == nil || !strings.Contains(err.Error(), "herdr pi_extension") || !strings.Contains(err.Error(), source) {
+		t.Fatalf("missing source did not fail clearly: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "job", "pi", "settings.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("settings written despite failed extension copy: %v", statErr)
+	}
+}
+
+func TestConcurrentHerdrWorkersNeverShareExtensionDestination(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "herdr-agent-state.ts")
+	want := []byte("concurrent-source-bytes\n")
+	if err := os.WriteFile(source, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := Adapter{Binary: "pi", HerdrExtension: source}
+	destinations := make([]string, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range destinations {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			jobDir := filepath.Join(root, fmt.Sprintf("job-%d", i))
+			j := protocol.Job{ID: fmt.Sprintf("j%d", i), CWD: root, Prompt: "go", Artifacts: protocol.ArtifactMetadata{Directory: jobDir}}
+			launch, err := a.Start(context.Background(), j)
+			errs[i] = err
+			if err == nil {
+				destinations[i] = filepath.Join(launch.Env[CodingDirEnv], "extensions", "herdr-agent-state.ts")
+			}
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("job %d: %v", i, err)
+		}
+	}
+	if destinations[0] == destinations[1] || destinations[0] == source || destinations[1] == source {
+		t.Fatalf("concurrent jobs share an extension: source=%q destinations=%v", source, destinations)
+	}
+	for _, destination := range destinations {
+		got, err := os.ReadFile(destination)
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("private copy %q = %q, %v; want %q", destination, got, err, want)
+		}
 	}
 }
 

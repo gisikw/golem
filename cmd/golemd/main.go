@@ -183,6 +183,14 @@ func main() {
 	}
 	slog.Info("run backend selected", "backend", runBackend.Policy().Name)
 
+	// Only a successfully selected Herdr backend receives the lifecycle
+	// extension source. The default tmux adapter remains exactly as before, and
+	// a configured Herdr that fell back to tmux does not alter worker profiles.
+	if herdrBackend != nil {
+		piAdapter.HerdrExtension = cfg.Herdr.PiExtension
+		adapters["pi"] = piAdapter
+	}
+
 	caps := cfg.Capabilities(version)
 	attachPort := cfg.AttachSSH.Port
 	if herdrBackend != nil {

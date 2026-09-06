@@ -100,3 +100,37 @@ func TestHerdrSectionIsOptionalAndResolvesASocket(t *testing.T) {
 		t.Fatal("unparseable reconcile_interval accepted")
 	}
 }
+
+func TestHerdrPiRequiresAReadableExtensionSource(t *testing.T) {
+	write := func(extension string) string {
+		path := filepath.Join(t.TempDir(), "golemd.toml")
+		data := "name = \"test\"\n[harnesses.pi]\nmodels = []\n[herdr]\n" + extension
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for name, extension := range map[string]string{
+		"missing setting": "",
+		"relative path":   "pi_extension = \"seed/extensions/herdr-agent-state.ts\"\n",
+		"missing source":  "pi_extension = \"/definitely/missing/herdr-agent-state.ts\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(write(extension)); err == nil || !strings.Contains(err.Error(), "herdr.pi_extension") {
+				t.Fatalf("invalid Herdr Pi extension accepted or unclear error: %v", err)
+			}
+		})
+	}
+
+	source := filepath.Join(t.TempDir(), "herdr-agent-state.ts")
+	if err := os.WriteFile(source, []byte("export default true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(write("pi_extension = \"" + source + "\"\n"))
+	if err != nil {
+		t.Fatalf("valid Herdr Pi extension rejected: %v", err)
+	}
+	if cfg.Herdr.PiExtension != source {
+		t.Fatalf("pi_extension changed: %q", cfg.Herdr.PiExtension)
+	}
+}

@@ -28,11 +28,11 @@ import (
 //
 // WORKER PROFILE ISOLATION IS A SECURITY/CORRECTNESS BOUNDARY. Each worker runs
 // under a private, per-job pi coding-agent dir written by the adapter at Start.
-// That dir's settings.json enumerates ONLY the worker extension set (agent-hooks
-// and, optionally, the self-contained web extension) — never the operator's
-// worklist/identity/attention/zip/handoff/agents-dispatch/subscriber/telemetry
-// suite. Workers therefore cannot dispatch other workers or receive operator
-// inbox/orientation machinery. The adapter sets PI_CODING_AGENT_DIR explicitly
+// That dir's settings.json enumerates ONLY the audited worker extension set
+// (agent-hooks and optional web/Tiamat/Herdr lifecycle extensions) — never the
+// operator's worklist/identity/attention/zip/handoff/agents-dispatch/subscriber/
+// telemetry suite. Workers therefore cannot dispatch other workers or receive
+// operator inbox/orientation machinery. The adapter sets PI_CODING_AGENT_DIR explicitly
 // so the operator's personal profile can never leak in through ambient env.
 type Adapter struct {
 	Binary string
@@ -45,6 +45,12 @@ type Adapter struct {
 	// It carries no operator-specific state; its SSRF guard defaults to
 	// public-only destinations, so it is safe in an isolated worker.
 	WebExtension string
+	// HerdrExtension is the operator-owned source herdr-agent-state.ts. It is
+	// set only when Herdr is the selected backend. Each Start/Resume copies its
+	// bytes into the job-private profile before settings.json is written; the
+	// source profile is never used as a worker profile and Herdr never writes
+	// the destination.
+	HerdrExtension string
 	// SourceProfile is a pi coding-agent dir whose model catalog
 	// (models-store.json), theme, and — only when CopyAuth is set — credentials
 	// (auth.json) seed each worker's isolated dir. It is NEVER used as the
@@ -156,8 +162,10 @@ func writeTaskContext(j protocol.Job) (string, error) {
 	return p, nil
 }
 
-// workerExtensions is the exact, auditable worker extension set. The leak-guard
-// test pins this list; adding operator extensions here is a security change.
+// workerExtensions is the exact, auditable externally supplied worker
+// extension set. Materialized Golem hooks, Tiamat, and the private Herdr copy
+// join this same settings.json allowlist below. The leak-guard test pins the
+// result; adding operator extensions here is a security change.
 func (a Adapter) workerExtensions() []string {
 	v := []string{}
 	if a.HookExtension != "" {
@@ -185,6 +193,9 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
 	provider, model := a.DefaultProvider, a.DefaultModel
 	if provider == "" || model == "" {
 		sp, sm := sourceDefaults(a.SourceProfile)
@@ -209,6 +220,13 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 		configured = true
 	}
 	extensions := a.workerExtensions()
+	if a.HerdrExtension != "" {
+		privateHerdr, err := copyHerdrExtension(a.HerdrExtension, dir)
+		if err != nil {
+			return err
+		}
+		extensions = append(extensions, privateHerdr)
+	}
 	if configured && configuredProvider.Kind == "tiamat" {
 		builtIn, err := piintegration.WriteTiamat(dir)
 		if err != nil {
@@ -277,7 +295,61 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "settings.json"), b, 0o600)
+	settingsPath := filepath.Join(dir, "settings.json")
+	if err = os.WriteFile(settingsPath, b, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(settingsPath, 0o600)
+}
+
+// copyHerdrExtension snapshots the configured source into this worker's
+// private extension directory. The fixed destination name matches Herdr's Pi
+// integration contract. A temporary file plus rename prevents settings.json
+// from ever naming a partial copy, and every failure is fatal to this start.
+func copyHerdrExtension(source, dir string) (string, error) {
+	src, err := os.Open(source)
+	if err != nil {
+		return "", fmt.Errorf("copy herdr pi_extension %q: %w", source, err)
+	}
+	defer src.Close()
+	info, err := src.Stat()
+	if err != nil {
+		return "", fmt.Errorf("copy herdr pi_extension %q: %w", source, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("copy herdr pi_extension %q: source is not a regular file", source)
+	}
+
+	extensionsDir := filepath.Join(dir, "extensions")
+	if err = os.MkdirAll(extensionsDir, 0o700); err != nil {
+		return "", fmt.Errorf("copy herdr pi_extension %q: %w", source, err)
+	}
+	if err = os.Chmod(extensionsDir, 0o700); err != nil {
+		return "", fmt.Errorf("copy herdr pi_extension %q: %w", source, err)
+	}
+	tmp, err := os.CreateTemp(extensionsDir, ".herdr-agent-state-*")
+	if err != nil {
+		return "", fmt.Errorf("copy herdr pi_extension %q: %w", source, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err = tmp.Chmod(0o600); err == nil {
+		_, err = io.Copy(tmp, src)
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return "", fmt.Errorf("copy herdr pi_extension %q: %w", source, err)
+	}
+	destination := filepath.Join(extensionsDir, "herdr-agent-state.ts")
+	if err = os.Rename(tmpName, destination); err != nil {
+		return "", fmt.Errorf("copy herdr pi_extension %q: %w", source, err)
+	}
+	if err = os.Chmod(destination, 0o600); err != nil {
+		return "", fmt.Errorf("copy herdr pi_extension %q: %w", source, err)
+	}
+	return destination, nil
 }
 
 // sourceDefaults reads only defaultProvider/defaultModel from a source pi
