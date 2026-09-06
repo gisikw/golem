@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gisikw/golem/protocol"
 	"github.com/pelletier/go-toml/v2"
@@ -38,6 +39,49 @@ type AttachSSH struct {
 	AuthorizedKeysPath string `toml:"authorized_keys_path"`
 }
 
+// Herdr selects the Herdr run substrate. Its absence is the default and means
+// the private tmux server, byte-for-byte as before. Its presence makes golemd
+// check the socket at startup and fall back to tmux, loudly, if the check
+// fails: golemd must come up either way.
+type Herdr struct {
+	// Socket is an explicit session socket path. When empty it is derived from
+	// Session as ~/.config/herdr/sessions/<session>/herdr.sock.
+	Socket string `toml:"socket"`
+	// Session is the named Herdr session this daemon owns (default "golem").
+	Session string `toml:"session"`
+	// StartupTimeoutMS bounds agent.start's readiness wait (3000..300000).
+	StartupTimeoutMS int `toml:"startup_timeout_ms"`
+	// ReconcileInterval is the safety-net poll (Go duration, default 15s).
+	ReconcileInterval string `toml:"reconcile_interval"`
+	// Kinds maps a Golem harness to a Herdr agent kind. Default {pi = "pi"};
+	// every other harness is rejected at dispatch with 400.
+	Kinds map[string]string `toml:"kinds"`
+}
+
+// SocketPath resolves the session socket this daemon must talk to.
+func (h Herdr) SocketPath() (string, error) {
+	if h.Socket != "" {
+		return h.Socket, nil
+	}
+	session := h.Session
+	if session == "" {
+		session = "golem"
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "herdr", "sessions", session, "herdr.sock"), nil
+}
+
+// Reconcile is the parsed poll interval; zero means the client default.
+func (h Herdr) Reconcile() (time.Duration, error) {
+	if h.ReconcileInterval == "" {
+		return 0, nil
+	}
+	return time.ParseDuration(h.ReconcileInterval)
+}
+
 type Config struct {
 	Name            string              `toml:"name"`
 	Harnesses       map[string]Harness  `toml:"harnesses"`
@@ -46,6 +90,7 @@ type Config struct {
 	CloneEnabled    bool                `toml:"clone_enabled"`
 	APIBearerTokens []string            `toml:"api_bearer_tokens"`
 	AttachSSH       AttachSSH           `toml:"attach_ssh"`
+	Herdr           *Herdr              `toml:"herdr"`
 }
 
 func Load(path string) (Config, error) {
@@ -135,6 +180,22 @@ func Load(path string) (Config, error) {
 	}
 	if c.AttachSSH.Port != 0 && (c.AttachSSH.HostKeyPath == "" || c.AttachSSH.AuthorizedKeysPath == "") {
 		return Config{}, errors.New("attach_ssh.host_key_path and authorized_keys_path are required when enabled")
+	}
+	if c.Herdr != nil {
+		if _, err = c.Herdr.SocketPath(); err != nil {
+			return Config{}, fmt.Errorf("herdr socket: %w", err)
+		}
+		if _, err = c.Herdr.Reconcile(); err != nil {
+			return Config{}, fmt.Errorf("herdr reconcile_interval: %w", err)
+		}
+		if t := c.Herdr.StartupTimeoutMS; t != 0 && (t < 3000 || t > 300000) {
+			return Config{}, errors.New("herdr startup_timeout_ms must be between 3000 and 300000")
+		}
+		for golem, kind := range c.Herdr.Kinds {
+			if golem == "" || kind == "" {
+				return Config{}, errors.New("herdr.kinds entries must be non-empty")
+			}
+		}
 	}
 	return c, nil
 }

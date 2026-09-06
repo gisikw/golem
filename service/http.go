@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gisikw/golem/artifacts"
+	"github.com/gisikw/golem/backend"
 	"github.com/gisikw/golem/protocol"
 )
 
@@ -27,6 +28,17 @@ type API struct {
 	Workspaces   *WorkspaceResolver
 	PiProviders  map[string]bool
 	ArtifactRoot string
+	// Backend describes the active run substrate. Its zero value is tmux: every
+	// configured harness dispatches, attach and steer work as they always have.
+	Backend backend.Policy
+}
+
+// backendName is the substrate's name for error messages.
+func (a API) backendName() string {
+	if a.Backend.Name == "" {
+		return "tmux"
+	}
+	return a.Backend.Name
 }
 
 func (a API) Handler() http.Handler {
@@ -53,6 +65,7 @@ func (a API) Handler() http.Handler {
 	m.HandleFunc("POST /v1/jobs/{id}/reap", a.reap)
 	m.HandleFunc("POST /v1/jobs/{id}/answer", a.answer)
 	m.HandleFunc("POST /v1/jobs/{id}/steer", a.steer)
+	m.HandleFunc("GET /v1/jobs/{id}/attach", a.attach)
 	m.HandleFunc("POST /v1/jobs/poll", a.poll)
 	m.HandleFunc("POST /v1/events", a.events)
 	m.HandleFunc("GET /v1/events", a.streamEvents)
@@ -90,6 +103,10 @@ func (a API) create(w http.ResponseWriter, r *http.Request) {
 	harness, ok := a.Capabilities.Harnesses[string(x.Harness)]
 	if !ok {
 		failure(w, fmt.Errorf("harness %q is not configured", x.Harness), http.StatusUnprocessableEntity)
+		return
+	}
+	if a.Backend.Harnesses != nil && !a.Backend.Harnesses[string(x.Harness)] {
+		failure(w, fmt.Errorf("harness %q not supported on %s backend", x.Harness, a.backendName()), http.StatusBadRequest)
 		return
 	}
 	if x.Model != "" {
@@ -163,6 +180,32 @@ func (a API) get(w http.ResponseWriter, r *http.Request) {
 	a.publicJob(&j)
 	output(w, 200, j)
 }
+
+// attach reports how to reach a job's live terminal. On a substrate Golem does
+// not proxy terminals for (herdr) it is an explicit 501 with the operator's
+// real route, not a fabricated endpoint.
+func (a API) attach(w http.ResponseWriter, r *http.Request) {
+	if a.Backend.NoAttach {
+		failure(w, fmt.Errorf("attach is not supported on %s backend: reach the job over ordinary SSH with `herdr agent attach job-<id>`", a.backendName()), http.StatusNotImplemented)
+		return
+	}
+	j, err := a.Store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		status := 500
+		if errors.Is(err, sql.ErrNoRows) {
+			status = 404
+		}
+		failure(w, err, status)
+		return
+	}
+	a.publicJob(&j)
+	if j.Terminal == nil && j.Activation == nil {
+		failure(w, errors.New("job has no live attach endpoint"), http.StatusConflict)
+		return
+	}
+	output(w, http.StatusOK, map[string]any{"terminal": j.Terminal, "activation": j.Activation})
+}
+
 func (a API) publicJob(j *protocol.Job) {
 	if a.Capabilities.AttachPort == 0 || j.State.Terminal() || j.Activation != nil && j.Activation.Port != a.Capabilities.AttachPort {
 		j.Activation = nil
@@ -201,6 +244,10 @@ func (a API) answer(w http.ResponseWriter, r *http.Request) {
 	output(w, 200, j)
 }
 func (a API) steer(w http.ResponseWriter, r *http.Request) {
+	if a.Backend.NoSteer {
+		failure(w, fmt.Errorf("steer is not supported on %s backend: answer an open question or dispatch a new job", a.backendName()), http.StatusNotImplemented)
+		return
+	}
 	// Decode the full protocol type (mirroring answer): clients marshal
 	// protocol.Steer, whose zero At field is always present because omitempty
 	// never omits struct values. Server-assigned fields are ignored.

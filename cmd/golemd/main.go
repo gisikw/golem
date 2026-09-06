@@ -19,6 +19,7 @@ import (
 
 	"github.com/gisikw/golem/attachssh"
 	"github.com/gisikw/golem/backend"
+	herdrbackend "github.com/gisikw/golem/backend/herdr"
 	tmuxbackend "github.com/gisikw/golem/backend/tmux"
 	"github.com/gisikw/golem/client"
 	golemconfig "github.com/gisikw/golem/config"
@@ -149,21 +150,6 @@ func main() {
 		projects[name] = project.Path
 	}
 	workspaceResolver := &service.WorkspaceResolver{State: *state, Projects: projects, CloneEnabled: cfg.CloneEnabled}
-	api := service.API{Store: store, Capabilities: cfg.Capabilities(version), Workspaces: workspaceResolver, PiProviders: providerNames, ArtifactRoot: *artifactRoot}
-	servers, listeners, err := serve(api.Handler(), *socket, *listen, cfg.APIBearerTokens)
-	if err != nil {
-		slog.Error("listen", "error", err)
-		os.Exit(1)
-	}
-	if len(servers) == 0 {
-		slog.Error("no listeners configured")
-		os.Exit(1)
-	}
-	defer func() {
-		for _, listener := range listeners {
-			_ = listener.Close()
-		}
-	}()
 
 	registry, err := supervisor.OpenRegistry(filepath.Join(*state, "workers.json"))
 	if err != nil {
@@ -179,6 +165,44 @@ func main() {
 		slog.Warn("tmux policy reapply on boot failed", "error", err)
 	}
 	var runBackend backend.Backend = tmuxBackend
+	var herdrBackend *herdrbackend.Backend
+	if cfg.Herdr != nil {
+		// Configured [herdr] selects the Herdr substrate, but golemd must come up
+		// either way: an unreachable socket or a protocol other than 20 falls back
+		// to tmux with a loud log line rather than refusing to start.
+		socketPath, socketErr := cfg.Herdr.SocketPath()
+		reconcile, _ := cfg.Herdr.Reconcile()
+		candidate := &herdrbackend.Backend{Socket: socketPath, Kinds: cfg.Herdr.Kinds, Reconcile: reconcile, StartupTimeout: time.Duration(cfg.Herdr.StartupTimeoutMS) * time.Millisecond}
+		if socketErr != nil {
+			slog.Error("HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX", "error", socketErr)
+		} else if prepareErr := candidate.Prepare(); prepareErr != nil {
+			slog.Error("HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX", "socket", socketPath, "error", prepareErr)
+		} else {
+			runBackend, herdrBackend = candidate, candidate
+		}
+	}
+	slog.Info("run backend selected", "backend", runBackend.Policy().Name)
+
+	caps := cfg.Capabilities(version)
+	attachPort := cfg.AttachSSH.Port
+	if herdrBackend != nil {
+		caps.AttachPort, attachPort = 0, 0
+	}
+	api := service.API{Store: store, Capabilities: caps, Workspaces: workspaceResolver, PiProviders: providerNames, ArtifactRoot: *artifactRoot, Backend: runBackend.Policy()}
+	servers, listeners, err := serve(api.Handler(), *socket, *listen, cfg.APIBearerTokens)
+	if err != nil {
+		slog.Error("listen", "error", err)
+		os.Exit(1)
+	}
+	if len(servers) == 0 {
+		slog.Error("no listeners configured")
+		os.Exit(1)
+	}
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	}()
 	roots := strings.Split(*allowedRoots, string(os.PathListSeparator))
 	for _, project := range cfg.Projects {
 		roots = append(roots, project.Path)
@@ -192,10 +216,16 @@ func main() {
 	if *socket == "" && len(cfg.APIBearerTokens) > 0 {
 		internalClient.Token = cfg.APIBearerTokens[0]
 	}
-	sup := &supervisor.Supervisor{Host: cfg.Name, Client: internalClient, Registry: registry, Backend: runBackend, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters, AttachHost: cfg.Name, AttachPort: cfg.AttachSSH.Port}
+	sup := &supervisor.Supervisor{Host: cfg.Name, Client: internalClient, Registry: registry, Backend: runBackend, OfflineWindow: *offline, Linger: *linger, ArtifactRoot: *artifactRoot, AllowedCWDRoots: roots, Adapters: adapters, AttachHost: cfg.Name, AttachPort: attachPort}
 
 	var sshServer *attachssh.Server
-	if cfg.AttachSSH.Port != 0 {
+	if cfg.AttachSSH.Port != 0 && herdrBackend != nil {
+		// The SSH attach listener exists to proxy tmux panes this daemon owns.
+		// On the herdr substrate there are none, so it is not started; attach is
+		// an explicit 501 pointing at ordinary SSH plus herdr.
+		slog.Warn("attach_ssh disabled: not supported on herdr backend", "port", cfg.AttachSSH.Port)
+	}
+	if cfg.AttachSSH.Port != 0 && herdrBackend == nil {
 		hostSigner, keyErr := attachssh.LoadOrCreateHostKey(cfg.AttachSSH.HostKeyPath)
 		if keyErr != nil {
 			slog.Error("SSH host key", "error", keyErr)
@@ -222,6 +252,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if herdrBackend != nil {
+		// The herdr substrate watches state asynchronously: per-pane event
+		// subscriptions plus a reconcile poll that also re-adopts live agents.
+		go herdrBackend.Run(ctx)
+	}
 	if err = sup.Tick(ctx); err != nil {
 		slog.Warn("initial reconcile unavailable; applying offline policy", "error", err)
 		sup.Recover(ctx)

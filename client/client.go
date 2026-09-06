@@ -108,6 +108,23 @@ func (c *Client) Steer(ctx context.Context, id string, steer protocol.Steer) (pr
 	e := c.do(ctx, "POST", "/v1/jobs/"+url.PathEscape(id)+"/steer", steer, &j)
 	return j, e
 }
+
+// Attach asks the daemon how to reach a job's live terminal. A substrate that
+// proxies no terminal answers 501 with the operator's real route.
+func (c *Client) Attach(ctx context.Context, id string) (protocol.TerminalEndpoint, *protocol.Activation, error) {
+	var out struct {
+		Terminal   *protocol.TerminalEndpoint `json:"terminal"`
+		Activation *protocol.Activation       `json:"activation"`
+	}
+	if e := c.do(ctx, "GET", "/v1/jobs/"+url.PathEscape(id)+"/attach", nil, &out); e != nil {
+		return protocol.TerminalEndpoint{}, nil, e
+	}
+	if out.Terminal == nil {
+		return protocol.TerminalEndpoint{}, out.Activation, nil
+	}
+	return *out.Terminal, out.Activation, nil
+}
+
 func (c *Client) Poll(ctx context.Context, k map[string]protocol.State) (protocol.PollResponse, error) {
 	var x protocol.PollResponse
 	e := c.do(ctx, "POST", "/v1/jobs/poll", protocol.PollRequest{Known: k}, &x)

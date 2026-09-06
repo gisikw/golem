@@ -273,21 +273,23 @@ func main() {
 		print(j)
 	case "attach":
 		need(args, 2)
-		j, e := c.Get(ctx, args[1])
+		// Ask the daemon first: a substrate that proxies no terminal answers 501
+		// with the operator's real route instead of a fabricated endpoint.
+		terminal, activation, e := c.Attach(ctx, args[1])
 		if e != nil {
 			fatal(e)
 		}
 		var command string
 		var argv []string
-		if j.Terminal != nil {
-			if info, statErr := os.Stat(j.Terminal.Socket); statErr == nil && info.Mode()&os.ModeSocket != 0 {
+		if terminal.Socket != "" {
+			if info, statErr := os.Stat(terminal.Socket); statErr == nil && info.Mode()&os.ModeSocket != 0 {
 				command = "tmux"
-				argv = []string{"tmux", "-S", j.Terminal.Socket, "attach-session", "-t", j.Terminal.Target}
+				argv = []string{"tmux", "-S", terminal.Socket, "attach-session", "-t", terminal.Target}
 			}
 		}
-		if command == "" && j.Activation != nil {
+		if command == "" && activation != nil {
 			command = "ssh"
-			argv = []string{"ssh", "-p", fmt.Sprint(j.Activation.Port), j.Activation.User + "@" + j.Activation.Host}
+			argv = []string{"ssh", "-p", fmt.Sprint(activation.Port), activation.User + "@" + activation.Host}
 		}
 		if command == "" {
 			fatal(errors.New("job has no live attach endpoint"))
@@ -302,17 +304,17 @@ func main() {
 		}
 	case "attach-hint":
 		need(args, 2)
-		j, e := c.Get(ctx, args[1])
+		terminal, _, e := c.Attach(ctx, args[1])
 		if e != nil {
 			fatal(e)
 		}
-		if j.Terminal == nil {
+		if terminal.Socket == "" {
 			fatal(fmt.Errorf("terminal endpoint not yet published"))
 		}
 		if jsonOut {
-			print(j.Terminal)
+			print(terminal)
 		} else {
-			fmt.Printf("host=%s tmux -S %q attach-session -t %q\n", j.Terminal.Host, j.Terminal.Socket, j.Terminal.Target)
+			fmt.Printf("host=%s tmux -S %q attach-session -t %q\n", terminal.Host, terminal.Socket, terminal.Target)
 		}
 	case "gc":
 		f := flag.NewFlagSet("gc", flag.ExitOnError)
