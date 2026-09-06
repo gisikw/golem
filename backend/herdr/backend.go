@@ -269,13 +269,8 @@ func (b *Backend) Start(ctx context.Context, id string, l harnesses.Launch) (str
 	if !ok {
 		return "", "", fmt.Errorf("harness %q not supported on herdr backend", harness)
 	}
-	var existing AgentInfo
-	var found bool
-	if err := b.call(ctx, func(c *Conn) error {
-		var e error
-		existing, found, e = c.AgentGet(ctx, name)
-		return e
-	}); err != nil {
+	existing, found, err := b.agent(ctx, name)
+	if err != nil {
 		return "", "", err
 	}
 	if found {
@@ -289,7 +284,7 @@ func (b *Backend) Start(ctx context.Context, id string, l harnesses.Launch) (str
 	env := launchEnv(l)
 	timeout := int(b.startupTimeout() / time.Millisecond)
 	var pane PaneInfo
-	err := b.call(ctx, func(c *Conn) error {
+	err = b.call(ctx, func(c *Conn) error {
 		var e error
 		_, pane, e = c.WorkspaceCreate(ctx, l.Dir, "golem/"+id, env)
 		return e
@@ -309,15 +304,18 @@ func (b *Backend) Start(ctx context.Context, id string, l harnesses.Launch) (str
 	if err != nil {
 		// The workspace exists but has no agent: close it so a retry does not
 		// leak one workspace per attempt.
-		if closeErr := b.call(context.WithoutCancel(ctx), func(c *Conn) error {
-			return c.WorkspaceClose(context.WithoutCancel(ctx), workspaceOf(pane.PaneID))
-		}); closeErr != nil {
+		if closeErr := b.closeWorkspace(ctx, workspaceOf(pane.PaneID)); closeErr != nil {
 			b.log().Warn("herdr workspace cleanup after failed start", "job", id, "error", closeErr)
 		}
 		return "", "", fmt.Errorf("herdr start %s: agent.start: %w", id, err)
 	}
 	if prompt != "" {
-		if err = b.call(ctx, func(c *Conn) error { return c.AgentPrompt(ctx, name, prompt) }); err != nil {
+		if err = b.promptWhenReady(ctx, name, prompt); err != nil {
+			// A workspace with an unprompted agent in it is worse than none: the
+			// next attempt would adopt an idle pi that was never given its task.
+			if closeErr := b.closeWorkspace(ctx, workspaceOf(pane.PaneID)); closeErr != nil {
+				b.log().Warn("herdr workspace cleanup after failed prompt", "job", id, "error", closeErr)
+			}
 			return "", "", fmt.Errorf("herdr start %s: agent.prompt: %w", id, err)
 		}
 	}
@@ -325,6 +323,65 @@ func (b *Backend) Start(ctx context.Context, id string, l harnesses.Launch) (str
 	b.watch(pane.PaneID)
 	b.log().Info("herdr agent started", "job", id, "agent", name, "pane", pane.PaneID, "workspace", workspaceOf(pane.PaneID))
 	return name, pane.PaneID, nil
+}
+
+// closeWorkspace tears a workspace down on a cleanup path where the caller's
+// context may already be cancelled.
+func (b *Backend) closeWorkspace(ctx context.Context, workspace string) error {
+	if workspace == "" {
+		return nil
+	}
+	ctx = context.WithoutCancel(ctx)
+	return b.call(ctx, func(c *Conn) error { return c.WorkspaceClose(ctx, workspace) })
+}
+
+// promptWhenReady submits the initial task once Herdr has bound the agent to
+// its name. agent.start returns as soon as it has detected the expected agent,
+// but the named binding can lag a beat: agent.prompt then answers
+// agent_not_ready ("not an active named agent"), observed against herdr 0.8.1.
+// Golem waits for the binding instead of failing a perfectly good worker.
+func (b *Backend) promptWhenReady(ctx context.Context, name, prompt string) error {
+	deadline := time.Now().Add(b.startupTimeout())
+	var lastErr error
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+		info, found, err := b.agent(ctx, name)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if !found || info.LaunchPending || !info.InteractiveReady {
+			lastErr = fmt.Errorf("agent %s not interactive-ready yet", name)
+			continue
+		}
+		err = b.call(ctx, func(c *Conn) error { return c.AgentPrompt(ctx, name, prompt) })
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !IsCode(err, "agent_not_ready") && !IsCode(err, "agent_not_found") {
+			return err
+		}
+	}
+	return lastErr
+}
+
+// agent is one agent.get by name or pane.
+func (b *Backend) agent(ctx context.Context, target string) (AgentInfo, bool, error) {
+	var info AgentInfo
+	var found bool
+	err := b.call(ctx, func(c *Conn) error {
+		var e error
+		info, found, e = c.AgentGet(ctx, target)
+		return e
+	})
+	return info, found, err
 }
 
 func (b *Backend) startupTimeout() time.Duration {
@@ -373,12 +430,7 @@ func workspaceOf(pane string) string {
 
 // Has reports whether this job's agent is still live in the session.
 func (b *Backend) Has(ctx context.Context, session string) bool {
-	var found bool
-	err := b.call(ctx, func(c *Conn) error {
-		var e error
-		_, found, e = c.AgentGet(ctx, session)
-		return e
-	})
+	_, found, err := b.agent(ctx, session)
 	return err == nil && found
 }
 
@@ -386,13 +438,7 @@ func (b *Backend) Has(ctx context.Context, session string) bool {
 // anywhere in the pane API (PR sketch B in the brief), so the exit code is
 // always nil: absence, not a status code, is the observable fact.
 func (b *Backend) Pane(ctx context.Context, target string) (bool, *int, error) {
-	var info AgentInfo
-	var found bool
-	err := b.call(ctx, func(c *Conn) error {
-		var e error
-		info, found, e = c.AgentGet(ctx, target)
-		return e
-	})
+	info, found, err := b.agent(ctx, target)
 	if err != nil {
 		return false, nil, err
 	}

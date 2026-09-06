@@ -28,6 +28,21 @@ herdr_home="$state/herdr-home"
 session=${HERDR_SMOKE_SESSION:-golem-smoke-$$}
 socket="$herdr_home/.config/herdr/sessions/$session/herdr.sock"
 mkdir -p "$herdr_home"
+mkdir -p "$herdr_home/.config/herdr"
+# Operator requirement, learned the hard way (see README "Backends"): the pane
+# shell must not clobber the PATH golemd puts in the workspace env, or Herdr
+# cannot resolve the harness executable. On NixOS an interactive bash
+# re-sources /etc/set-environment and wipes it, so this session's panes use a
+# shell that runs no profile or rc files.
+cat >"$state/pane-shell" <<'SHELL'
+#!/usr/bin/env bash
+exec bash --norc --noprofile "$@"
+SHELL
+chmod +x "$state/pane-shell"
+cat >"$herdr_home/.config/herdr/config.toml" <<EOF
+[terminal]
+default_shell = "$state/pane-shell"
+EOF
 golemd_pid=
 herdr_pid=
 

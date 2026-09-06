@@ -184,6 +184,7 @@ type AgentInfo struct {
 	TabID            string  `json:"tab_id"`
 	AgentStatus      string  `json:"agent_status"`
 	InteractiveReady bool    `json:"interactive_ready"`
+	LaunchPending    bool    `json:"launch_pending"`
 	CWD              *string `json:"cwd"`
 }
 

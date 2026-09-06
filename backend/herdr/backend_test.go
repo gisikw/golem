@@ -152,25 +152,30 @@ func TestPrepareRequiresProtocol20(t *testing.T) {
 }
 
 func TestStartCreatesWorkspaceThenAgentThenPrompt(t *testing.T) {
+	started := false
 	fake := newFakeHerdr(t, func(method string, params map[string]any) (any, *Error) {
 		switch method {
 		case "ping":
 			return pongFrame(20), nil
 		case "agent.get":
-			return nil, &Error{Code: "agent_not_found", Message: "agent target not found"}
+			if !started {
+				return nil, &Error{Code: "agent_not_found", Message: "agent target not found"}
+			}
+			return agentInfo("job-abc", "w1:p1", "idle"), nil
 		case "workspace.create":
 			return map[string]any{"type": "workspace_created",
 				"workspace": map[string]any{"workspace_id": "w1", "label": params["label"]},
 				"tab":       map[string]any{"tab_id": "w1:t1", "workspace_id": "w1"},
 				"root_pane": map[string]any{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent_status": "unknown"}}, nil
 		case "agent.start":
+			started = true
 			return agentInfo("job-abc", "w1:p1", "working"), nil
 		case "agent.prompt":
 			return agentInfo("job-abc", "w1:p1", "working"), nil
 		}
 		return nil, &Error{Code: "unexpected", Message: method}
 	})
-	b := &Backend{Socket: fake.socket}
+	b := &Backend{Socket: fake.socket, StartupTimeout: 5 * time.Second}
 	session, target, err := b.Start(context.Background(), "abc", harnesses.Launch{
 		Argv:   []string{"/opt/pi/bin/pi", "--session", "/tmp/s.jsonl", "do the thing"},
 		Dir:    "/tmp",
@@ -183,7 +188,7 @@ func TestStartCreatesWorkspaceThenAgentThenPrompt(t *testing.T) {
 	if session != "job-abc" || target != "w1:p1" {
 		t.Fatalf("unexpected binding %q/%q", session, target)
 	}
-	want := []string{"agent.get", "workspace.create", "agent.start", "agent.prompt"}
+	want := []string{"agent.get", "workspace.create", "agent.start", "agent.get", "agent.prompt"}
 	got := fake.methods()
 	if len(got) != len(want) {
 		t.Fatalf("call sequence %v, want %v", got, want)
@@ -397,5 +402,34 @@ func TestAgentNameIsAValidUniqueHerdrName(t *testing.T) {
 	}
 	if AgentName("abc") != "job-abc" {
 		t.Fatalf("unexpected name %q", AgentName("abc"))
+	}
+}
+
+// agent.start returns as soon as Herdr has detected the agent, but the named
+// binding can lag: agent.prompt then answers agent_not_ready. Golem must wait
+// for the binding instead of failing a worker that is about to be fine.
+func TestPromptWaitsForTheNamedAgentBinding(t *testing.T) {
+	gets := 0
+	fake := newFakeHerdr(t, func(method string, params map[string]any) (any, *Error) {
+		switch method {
+		case "agent.get":
+			gets++
+			info := agentInfo("job-abc", "w1:p1", "idle").(map[string]any)
+			if gets < 3 {
+				info["agent"].(map[string]any)["launch_pending"] = true
+				info["agent"].(map[string]any)["interactive_ready"] = false
+			}
+			return info, nil
+		case "agent.prompt":
+			return agentInfo("job-abc", "w1:p1", "working"), nil
+		}
+		return nil, &Error{Code: "unexpected", Message: method}
+	})
+	b := &Backend{Socket: fake.socket, StartupTimeout: 10 * time.Second}
+	if err := b.promptWhenReady(context.Background(), "job-abc", "go"); err != nil {
+		t.Fatalf("prompt never landed: %v", err)
+	}
+	if _, ok := fake.call("agent.prompt"); !ok {
+		t.Fatalf("no prompt was submitted: %v", fake.methods())
 	}
 }
