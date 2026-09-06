@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -135,7 +136,9 @@ func (s *Server) writeConfig() error {
 func (s *Server) installPiIntegration(ctx context.Context) error {
 	target := s.PiExtension()
 	if info, err := os.Lstat(target); err == nil && info.Mode().IsRegular() {
-		return nil // stable seed: do not silently replace bytes between jobs
+		// Stable seed: do not silently replace bytes between jobs. Still repair
+		// permissions in case an older installer created world-readable paths.
+		return s.restrictPiSeed()
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -156,6 +159,18 @@ func (s *Server) installPiIntegration(ctx context.Context) error {
 	if err != nil || !info.Mode().IsRegular() {
 		return fmt.Errorf("Herdr integration install did not create regular file %s", target)
 	}
+	return s.restrictPiSeed()
+}
+
+func (s *Server) restrictPiSeed() error {
+	for _, dir := range []string{filepath.Join(s.Root, "pi-seed"), filepath.Dir(s.PiExtension())} {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("restrict private Herdr Pi seed: %w", err)
+		}
+	}
+	if err := os.Chmod(s.PiExtension(), 0o600); err != nil {
+		return fmt.Errorf("restrict private Herdr Pi extension: %w", err)
+	}
 	return nil
 }
 
@@ -174,7 +189,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	// Check before writing config: even Golem's own namespace may contain an
 	// orphan from a hard crash, and refusing ownership must be non-mutating.
-	if liveSocket(s.SocketPath(), 500*time.Millisecond) {
+	if socketReachable(s.SocketPath(), 500*time.Millisecond) {
 		return fmt.Errorf("private Herdr already running at %s; refusing to attach", s.SocketPath())
 	}
 	if info, err := os.Lstat(s.SocketPath()); err == nil {
@@ -247,6 +262,18 @@ func (s *Server) stopAfterFailedStart() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = s.Stop(ctx)
+}
+
+// socketReachable deliberately performs no Herdr request. Any process that is
+// accepting connections at the private path owns it; even an incompatible or
+// non-Herdr listener must not be unlinked as though it were a stale inode.
+func socketReachable(path string, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("unix", path, timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func liveSocket(path string, timeout time.Duration) bool {

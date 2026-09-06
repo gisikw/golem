@@ -132,6 +132,19 @@ func TestOwnedServerIsolationSeedLifecycleAndNoAttach(t *testing.T) {
 	if err != nil || !strings.Contains(string(seed), "helper lifecycle") {
 		t.Fatalf("stable lifecycle seed missing: %q, %v", seed, err)
 	}
+	for path, want := range map[string]os.FileMode{
+		filepath.Join(root, "pi-seed"): 0o700,
+		filepath.Dir(s.PiExtension()):  0o700,
+		s.PiExtension():                0o600,
+	} {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			t.Fatalf("stat private seed path %s: %v", path, statErr)
+		}
+		if info.Mode().Perm() != want {
+			t.Fatalf("private seed mode for %s = %v, want %v", path, info.Mode().Perm(), want)
+		}
+	}
 	config, err := os.ReadFile(s.configPath())
 	if err != nil {
 		t.Fatal(err)
@@ -163,8 +176,67 @@ func TestOwnedServerIsolationSeedLifecycleAndNoAttach(t *testing.T) {
 	if liveSocket(s.SocketPath(), 100*time.Millisecond) {
 		t.Fatal("private socket survived owner shutdown")
 	}
+
+	// A restart preserves seed bytes across a bundled Herdr upgrade, while
+	// repairing permissions an older installer may have left too broad.
+	stable := []byte("// deliberately retained seed\n")
+	if err = os.WriteFile(s.PiExtension(), stable, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chmod(s.PiExtension(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Server{Binary: s.Binary, Root: root, Session: s.Session, StartupTimeout: time.Second}
+	if err = restarted.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	gotSeed, err := os.ReadFile(restarted.PiExtension())
+	if err != nil || string(gotSeed) != string(stable) {
+		t.Fatalf("restart replaced stable lifecycle seed: %q, %v", gotSeed, err)
+	}
+	info, err := os.Stat(restarted.PiExtension())
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("restart did not restrict stable lifecycle seed: %v, %v", info, err)
+	}
+	restartCtx, restartCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err = restarted.Stop(restartCtx); err != nil {
+		restartCancel()
+		t.Fatal(err)
+	}
+	restartCancel()
+
 	if _, err = os.Stat(userSocket); err != nil {
 		t.Fatalf("user Herdr socket was touched: %v", err)
+	}
+}
+
+func TestOwnedServerRefusesReachableNonHerdrSocketWithoutUnlinking(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "gh-occupied-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	s := &Server{Binary: helperBinary(t), Root: root, Session: "occupied", StartupTimeout: time.Second}
+	if err = os.MkdirAll(filepath.Dir(s.SocketPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", s.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	before, err := os.Lstat(s.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "refusing to attach") {
+		t.Fatalf("reachable non-Herdr socket was not refused: %v", err)
+	}
+	after, statErr := os.Lstat(s.SocketPath())
+	if statErr != nil || !os.SameFile(before, after) {
+		t.Fatalf("pre-existing live socket was replaced: before=%v after=%v error=%v", before, after, statErr)
 	}
 }
 

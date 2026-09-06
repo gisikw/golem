@@ -164,6 +164,11 @@ func main() {
 	if err = tmuxBackend.ReapplyPolicy(context.Background()); err != nil {
 		slog.Warn("tmux policy reapply on boot failed", "error", err)
 	}
+	// Install signal handling before starting a child so a service stop during
+	// Herdr provisioning/readiness gives Start a chance to reap that child.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	var runBackend backend.Backend = tmuxBackend
 	var herdrBackend *herdrbackend.Backend
 	if cfg.Herdr != nil {
@@ -187,7 +192,7 @@ func main() {
 		owned := &herdrbackend.Server{Binary: binary, Root: root, Session: cfg.Herdr.Session, Shell: shell, StartupTimeout: serverStartup}
 		reconcile, _ := cfg.Herdr.Reconcile()
 		candidate := &herdrbackend.Backend{Socket: owned.SocketPath(), Kinds: cfg.Herdr.Kinds, Reconcile: reconcile, StartupTimeout: time.Duration(cfg.Herdr.StartupTimeoutMS) * time.Millisecond, Owner: owned}
-		if startErr := owned.Start(context.Background()); startErr != nil {
+		if startErr := owned.Start(ctx); startErr != nil {
 			slog.Error("HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX", "root", root, "error", startErr)
 		} else if prepareErr := candidate.Prepare(); prepareErr != nil {
 			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -221,12 +226,10 @@ func main() {
 	api := service.API{Store: store, Capabilities: caps, Workspaces: workspaceResolver, PiProviders: providerNames, ArtifactRoot: *artifactRoot, Backend: runBackend.Policy()}
 	servers, listeners, err := serve(api.Handler(), *socket, *listen, cfg.APIBearerTokens)
 	if err != nil {
-		slog.Error("listen", "error", err)
-		os.Exit(1)
+		exitAfterBackendFailure(runBackend, "listen", err)
 	}
 	if len(servers) == 0 {
-		slog.Error("no listeners configured")
-		os.Exit(1)
+		exitAfterBackendFailure(runBackend, "no listeners configured", nil)
 	}
 	defer func() {
 		for _, listener := range listeners {
@@ -258,18 +261,15 @@ func main() {
 	if cfg.AttachSSH.Port != 0 && herdrBackend == nil {
 		hostSigner, keyErr := attachssh.LoadOrCreateHostKey(cfg.AttachSSH.HostKeyPath)
 		if keyErr != nil {
-			slog.Error("SSH host key", "error", keyErr)
-			os.Exit(1)
+			exitAfterBackendFailure(runBackend, "SSH host key", keyErr)
 		}
 		authorized, keysErr := attachssh.LoadAuthorizedKeys(cfg.AttachSSH.AuthorizedKeysPath)
 		if keysErr != nil {
-			slog.Error("SSH authorized keys", "error", keysErr)
-			os.Exit(1)
+			exitAfterBackendFailure(runBackend, "SSH authorized keys", keysErr)
 		}
 		sshListener, listenErr := net.Listen("tcp", fmt.Sprintf(":%d", cfg.AttachSSH.Port))
 		if listenErr != nil {
-			slog.Error("SSH attach listen", "error", listenErr)
-			os.Exit(1)
+			exitAfterBackendFailure(runBackend, "SSH attach listen", listenErr)
 		}
 		sshServer = attachssh.New(registry, tmuxBackend, hostSigner, authorized)
 		go func() {
@@ -280,8 +280,6 @@ func main() {
 		}()
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	if herdrBackend != nil {
 		// The herdr substrate watches state asynchronously: per-pane event
 		// subscriptions plus a reconcile poll that also re-adopts live agents.
@@ -306,9 +304,26 @@ func main() {
 	}
 }
 
+// exitAfterBackendFailure reaps private process infrastructure before a fatal
+// startup exit. os.Exit skips defers, so each failure after backend selection
+// must pass through this helper.
+func exitAfterBackendFailure(runBackend backend.Backend, message string, cause error) {
+	if cause != nil {
+		slog.Error(message, "error", cause)
+	} else {
+		slog.Error(message)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := runBackend.Shutdown(ctx); err != nil {
+		slog.Error("run backend cleanup after startup failure", "error", err)
+	}
+	os.Exit(1)
+}
+
 // shutdownDaemon runs only after the signal context has stopped the
 // supervisor loop. First stop accepting API/attach traffic, then tear down the
-// private tmux process boundary and every worker pane it owns. Store state is
+// private process boundary and every worker pane it owns. Store state is
 // deliberately untouched: boot reconciliation either resumes a capable
 // adapter or records a vanished non-resumable worker as failed; shutdown never
 // fabricates successful completion.
