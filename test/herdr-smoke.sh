@@ -85,6 +85,10 @@ kind = "${GOLEM_SMOKE_PROVIDER_KIND:-tiamat}"
 [harnesses.pi]
 models = ["$model"]
 
+# Configured but unsupported by this substrate: dispatch must be a clear 400.
+[harnesses.claude]
+models = ["anthropic/claude-sonnet-4"]
+
 [projects.scratch]
 path = "$project"
 description = "Herdr smoke project"
@@ -158,7 +162,14 @@ done
 herdrctl workspace list | grep -q "golem/$id2" || { echo "no herdr workspace for the second job" >&2; exit 1; }
 agent2="job-${id2#job-}"
 agent2=${agent2:0:32}
+# Cancel a genuinely live agent, not one still launching: wait for Herdr to
+# report it interactive-ready first.
+for _ in $(seq 1 120); do
+  herdrctl agent get "$agent2" 2>/dev/null | grep -q '"interactive_ready":true' && break
+  sleep 1
+done
 herdrctl agent get "$agent2"
+herdrctl agent get "$agent2" | grep -q '"interactive_ready":true' || { echo "second agent never became interactive-ready" >&2; exit 1; }
 "${cli[@]}" cancel "$id2" >/dev/null
 for _ in $(seq 1 60); do
   state2=$(sed -n 's/.*"state":"\([^"]*\)".*/\1/p' <<<"$("${cli[@]}" --json status "$id2")")
@@ -183,17 +194,18 @@ else
   echo "tmux ls: no private tmux server was ever started"
 fi
 
-echo "--- attach/steer are 501 ---"
-attach=$(curl -s -o "$state/attach.json" -w '%{http_code}' --unix-socket "$gsocket" "http://unix/v1/jobs/$id/attach")
-steer=$(curl -s -o "$state/steer.json" -w '%{http_code}' --unix-socket "$gsocket" -X POST -H 'Content-Type: application/json' \
-  -d '{"id":"","job_id":"","text":"left","at":"0001-01-01T00:00:00Z"}' "http://unix/v1/jobs/$id/steer")
-echo "attach=$attach $(cat "$state/attach.json")"
-echo "steer=$steer $(cat "$state/steer.json")"
-[[ "$attach" == 501 && "$steer" == 501 ]] || { echo "attach/steer did not report 501" >&2; exit 1; }
-
-echo "--- claude dispatch is 400 on this backend ---"
-claude=$(curl -s -o "$state/claude.json" -w '%{http_code}' --unix-socket "$gsocket" -X POST -H 'Content-Type: application/json' \
-  -d '{"idempotency_key":"smoke-claude","harness":"claude","cwd":"/tmp","prompt":"hi"}' "http://unix/v1/jobs")
-echo "claude=$claude $(cat "$state/claude.json")"
+echo "--- attach/steer are 501, claude dispatch is 400 ---"
+set +e
+attach_out=$("${cli[@]}" attach "$id" 2>&1)
+steer_out=$("${cli[@]}" steer "$id" go left 2>&1)
+claude_out=$("${cli[@]}" dispatch --harness claude --model anthropic/claude-sonnet-4 --project scratch --worktree mvp3 'hi' 2>&1)
+set -e
+echo "attach: $attach_out"
+echo "steer:  $steer_out"
+echo "claude: $claude_out"
+grep -q '501' <<<"$attach_out" || { echo "attach did not report 501" >&2; exit 1; }
+grep -q '501' <<<"$steer_out" || { echo "steer did not report 501" >&2; exit 1; }
+grep -q '400' <<<"$claude_out" || { echo "claude dispatch did not report 400" >&2; exit 1; }
+grep -q 'not supported on herdr backend' <<<"$claude_out" || { echo "claude rejection message unclear" >&2; exit 1; }
 
 echo 'herdr smoke: PASS'
