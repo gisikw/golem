@@ -15,6 +15,25 @@ Golem is a standalone delegated-worker system. One `golemd` daemon per host owns
 
 Portable artifact storage remains deferred. The separately configured SSH attach listener is public-key-only and terminal-only.
 
+## Backends
+
+The run substrate is behind a `Backend` interface (`backend/`): start a harness process for a job with cwd/env/prompt, observe it, deliver text, cancel, tear down.
+
+- **tmux (default, unchanged).** `backend/tmux` is golemd's private tmux server, its pinned policy, keystroke steering, and the host-local `terminal` endpoint that `golem attach` and the SSH attach listener use. This is what runs when `[herdr]` is absent from the config, byte for byte as before.
+- **herdr (opt-in).** `backend/herdr` drives one [Herdr](https://herdr.dev) session on this host over its newline-delimited JSON socket (protocol 20): `workspace.create` → `agent.start --kind pi` → `agent.prompt`, per-pane `events.subscribe` for state plus a 15 s `agent.list` reconcile as the safety net, restart adoption by agent name (`job-<id>`), and cancel as `esc`/`ctrl+c` → `workspace.close` → verified absence of both agent and workspace.
+
+Enable it with a `[herdr]` block (see [`golemd.example.toml`](golemd.example.toml)). At startup golemd pings the socket and requires protocol 20; if the socket is unreachable or speaks anything else it logs `HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX` and comes up on tmux anyway. The selected substrate is logged as `run backend selected backend=…`.
+
+On the herdr backend, in this first cut:
+
+- only `pi` runs; any other harness is `400 harness "…" not supported on herdr backend` at dispatch;
+- `attach` and `steer` are `501` with the real route (`herdr agent attach job-<id>` over ordinary SSH); no `terminal`/`activation` is published and the SSH attach listener is not started;
+- questions, answers, artifacts, and settlements are unchanged — they ride pi's existing side channel, not Herdr;
+- state observations map `working`/`idle`/`done` → running, `blocked` → blocked, `unknown` → last known state flagged stale, and `as_of` is golemd's receipt time (Herdr events carry no timestamp and no resumable cursor);
+- Herdr's server is not golemd's to stop, so shutdown leaves live agents alone and re-adopts them by name on the next start.
+
+Operator requirements on the Herdr side: `herdr integration install pi`, a pinned Herdr version, and a pane shell that does not clobber `PATH` (`[terminal] default_shell` — Herdr resolves the harness executable through the pane's `PATH`, and an interactive login shell may replace it with the system default). `./test/herdr-smoke.sh` starts a disposable herdr server configured exactly that way and runs a real pi job through it.
+
 ## Requirements
 
 Go 1.23+, plus `tmux`, `bash`, and `git` for supervised workers. Nix is optional.
@@ -95,6 +114,7 @@ go test ./...
 go build ./...
 go vet ./...
 ./test/standalone-smoke.sh
+./test/herdr-smoke.sh   # real herdr server + real pi job; needs herdr and pi on PATH
 ```
 
 ## API and architecture
@@ -104,6 +124,7 @@ The listener exposes:
 - `GET /v1/capabilities`
 - `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`
 - `GET /v1/jobs/{id}/artifacts` and `GET /v1/jobs/{id}/artifacts/{path...}`
+- `GET /v1/jobs/{id}/attach` (terminal descriptor, or `501` on a substrate that proxies none)
 - `GET /v1/events?since=SEQ[&job=ID]` (durable replay + live SSE)
 - `POST /v1/jobs/{id}/{cancel,reap,answer,steer}`
 - internal local reconciliation via `POST /v1/jobs/poll` and `POST /v1/events`

@@ -33,3 +33,23 @@ description = "Local scratch space"
 port = 0
 host_key_path = "/tmp/golemd-attach-host-key"
 authorized_keys_path = "/tmp/golemd-authorized-keys"
+
+# Optional Herdr run substrate. Absent (the default) means golemd's own private
+# tmux server, unchanged. Present means golemd pings this session socket at
+# startup, requires protocol 20, and — if either check fails — logs
+# HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX and comes up on tmux anyway.
+# On this backend only pi runs (other harnesses are 400 at dispatch) and
+# attach/steer are 501; reach a job with `herdr agent attach job-<id>` over SSH.
+# [herdr]
+# session = "golem"              # -> ~/.config/herdr/sessions/golem/herdr.sock
+# socket = ""                    # explicit socket path; wins over session
+# startup_timeout_ms = 60000     # bounds agent.start (3000..300000)
+# reconcile_interval = "15s"     # safety-net agent.list poll
+# [herdr.kinds]                  # golem harness -> herdr agent kind
+# pi = "pi"
+#
+# Herdr-side operator requirements: `herdr integration install pi`, a pinned
+# herdr version, and a pane shell that does not replace the PATH golemd puts in
+# the workspace env (herdr resolves the harness executable through it):
+#   [terminal]
+#   default_shell = "/path/to/a/shell/that/runs/no/profile"
