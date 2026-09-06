@@ -167,18 +167,40 @@ func main() {
 	var runBackend backend.Backend = tmuxBackend
 	var herdrBackend *herdrbackend.Backend
 	if cfg.Herdr != nil {
-		// Configured [herdr] selects the Herdr substrate, but golemd must come up
-		// either way: an unreachable socket or a protocol other than 20 falls back
-		// to tmux with a loud log line rather than refusing to start.
-		socketPath, socketErr := cfg.Herdr.SocketPath()
+		// [herdr] starts a child in STATE/herdr by default. Every Herdr selector
+		// is explicit and isolated by Server; it refuses an already-live socket
+		// rather than accidentally adopting any process. Failure remains the
+		// existing loud fallback contract.
+		root := cfg.Herdr.Root
+		if root == "" {
+			root = filepath.Join(*state, "herdr")
+		}
+		binary := cfg.Herdr.Binary
+		if binary == "" {
+			binary = env("GOLEM_HERDR", "herdr")
+		}
+		shell := cfg.Herdr.Shell
+		if shell == "" {
+			shell = env("GOLEM_HERDR_SHELL", "/bin/sh")
+		}
+		serverStartup, _ := cfg.Herdr.ServerStartup()
+		owned := &herdrbackend.Server{Binary: binary, Root: root, Session: cfg.Herdr.Session, Shell: shell, StartupTimeout: serverStartup}
 		reconcile, _ := cfg.Herdr.Reconcile()
-		candidate := &herdrbackend.Backend{Socket: socketPath, Kinds: cfg.Herdr.Kinds, Reconcile: reconcile, StartupTimeout: time.Duration(cfg.Herdr.StartupTimeoutMS) * time.Millisecond}
-		if socketErr != nil {
-			slog.Error("HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX", "error", socketErr)
+		candidate := &herdrbackend.Backend{Socket: owned.SocketPath(), Kinds: cfg.Herdr.Kinds, Reconcile: reconcile, StartupTimeout: time.Duration(cfg.Herdr.StartupTimeoutMS) * time.Millisecond, Owner: owned}
+		if startErr := owned.Start(context.Background()); startErr != nil {
+			slog.Error("HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX", "root", root, "error", startErr)
 		} else if prepareErr := candidate.Prepare(); prepareErr != nil {
-			slog.Error("HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX", "socket", socketPath, "error", prepareErr)
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if stopErr := owned.Stop(stopCtx); stopErr != nil {
+				slog.Error("private Herdr cleanup after failed prepare", "error", stopErr)
+			}
+			stopCancel()
+			slog.Error("HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX", "socket", owned.SocketPath(), "error", prepareErr)
 		} else {
 			runBackend, herdrBackend = candidate, candidate
+			if cfg.Herdr.PiExtension == "" {
+				cfg.Herdr.PiExtension = owned.PiExtension()
+			}
 		}
 	}
 	slog.Info("run backend selected", "backend", runBackend.Policy().Name)

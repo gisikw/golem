@@ -353,3 +353,30 @@ real verified cancel). Additions to §7, all verified live rather than read off 
 - Two `TestPrivateTmux*` tests fail on this host both before and after the change (a tmux version
   difference in the PageUp/copy-mode binding assertion), so "the existing suite is green" means
   "unchanged", not "all green".
+
+
+## 9. Private-server shipping update (implemented)
+
+The earlier host-shared-server and manual-seed assumptions in §§2, 5, 7, and
+8 are superseded by the shipping implementation. A configured `[herdr]` now
+makes golemd start and own a foreground Herdr child below `STATE/herdr` (or an
+absolute configured root). It passes both `--session` and isolated
+`HERDR_SESSION`, `HERDR_SOCKET_PATH`, `HERDR_CONFIG_PATH`, `HOME`,
+`XDG_CONFIG_HOME`, and `XDG_STATE_HOME`; inherited Herdr selectors are removed.
+A live socket in that namespace is refused, never attached. Shutdown signals
+only the recorded child process and never executes an ambient `herdr server
+stop`.
+
+The flake pins the official Herdr 0.8.2 artifact and a no-profile/no-rc bash
+pane shell. Generated config fixes `shell_mode = "non_login"`,
+`resume_agents_on_restore = false`, `version_check = false`, and
+`manifest_check = false`. Golemd installs the bundled Pi lifecycle integration
+once into `ROOT/pi-seed` and retains those stable bytes; the adapter's existing
+atomic per-job copy remains the only path named by worker settings. The opt-in
+and loud tmux fallback remain unchanged.
+
+The unavoidable hard-crash edge is explicit: an orphan in the private
+namespace is not adopted or killed automatically. The replacement daemon
+falls back to tmux until an operator verifies and terminates that exact old
+child. This trades automatic recovery for the stronger guarantee that Golem
+cannot attach to or kill a user's Herdr.

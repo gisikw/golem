@@ -54,9 +54,9 @@ func TestLoadRejectsMissingAndRelativeProjectPaths(t *testing.T) {
 	}
 }
 
-// [herdr] is optional: its absence must leave the daemon on tmux, and its
-// presence must resolve a socket without inventing one.
-func TestHerdrSectionIsOptionalAndResolvesASocket(t *testing.T) {
+// [herdr] is optional: absence leaves the daemon on tmux, while presence
+// validates only private-daemon controls (socket selection is not exposed).
+func TestHerdrSectionIsOptionalAndValidatesPrivateControls(t *testing.T) {
 	base := "name = \"test\"\n[harnesses.fake]\nmodels = []\n"
 	write := func(body string) string {
 		path := filepath.Join(t.TempDir(), "golemd.toml")
@@ -72,13 +72,12 @@ func TestHerdrSectionIsOptionalAndResolvesASocket(t *testing.T) {
 	if cfg.Herdr != nil {
 		t.Fatal("absent [herdr] must not select the herdr backend")
 	}
-	cfg, err = Load(write("[herdr]\nsocket = \"/run/herdr/golem.sock\"\nreconcile_interval = \"15s\"\nstartup_timeout_ms = 60000\n[herdr.kinds]\npi = \"pi\"\n"))
+	cfg, err = Load(write("[herdr]\nroot = \"/var/lib/golem/herdr\"\nsession = \"golem-test\"\nshell = \"/bin/sh\"\nserver_startup_timeout = \"10s\"\nreconcile_interval = \"15s\"\nstartup_timeout_ms = 60000\n[herdr.kinds]\npi = \"pi\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	socket, err := cfg.Herdr.SocketPath()
-	if err != nil || socket != "/run/herdr/golem.sock" {
-		t.Fatalf("socket %q %v", socket, err)
+	if cfg.Herdr.Root != "/var/lib/golem/herdr" || cfg.Herdr.Session != "golem-test" {
+		t.Fatalf("private controls lost: %#v", cfg.Herdr)
 	}
 	if interval, intervalErr := cfg.Herdr.Reconcile(); intervalErr != nil || interval.String() != "15s" {
 		t.Fatalf("reconcile %v %v", interval, intervalErr)
@@ -90,18 +89,20 @@ func TestHerdrSectionIsOptionalAndResolvesASocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if socket, err = cfg.Herdr.SocketPath(); err != nil || !strings.HasSuffix(socket, "/.config/herdr/sessions/golem/herdr.sock") {
-		t.Fatalf("session socket %q %v", socket, err)
-	}
 	if _, err = Load(write("[herdr]\nstartup_timeout_ms = 10\n")); err == nil {
 		t.Fatal("out-of-range startup_timeout_ms accepted")
 	}
 	if _, err = Load(write("[herdr]\nreconcile_interval = \"soon\"\n")); err == nil {
 		t.Fatal("unparseable reconcile_interval accepted")
 	}
+	for _, bad := range []string{"root = \"relative\"", "binary = \"herdr\"", "shell = \"bash\"", "session = \"bad/session\"", "session = \"..\"", "server_startup_timeout = \"soon\"", "server_startup_timeout = \"-1s\""} {
+		if _, err = Load(write("[herdr]\n" + bad + "\n")); err == nil {
+			t.Fatalf("invalid private Herdr control accepted: %s", bad)
+		}
+	}
 }
 
-func TestHerdrPiRequiresAReadableExtensionSource(t *testing.T) {
+func TestHerdrPiOptionalOverrideMustBeReadable(t *testing.T) {
 	write := func(extension string) string {
 		path := filepath.Join(t.TempDir(), "golemd.toml")
 		data := "name = \"test\"\n[harnesses.pi]\nmodels = []\n[herdr]\n" + extension
@@ -110,10 +111,13 @@ func TestHerdrPiRequiresAReadableExtensionSource(t *testing.T) {
 		}
 		return path
 	}
+	// Empty selects the seed that golemd installs with its bundled binary.
+	if _, err := Load(write("")); err != nil {
+		t.Fatalf("default bundled seed rejected: %v", err)
+	}
 	for name, extension := range map[string]string{
-		"missing setting": "",
-		"relative path":   "pi_extension = \"seed/extensions/herdr-agent-state.ts\"\n",
-		"missing source":  "pi_extension = \"/definitely/missing/herdr-agent-state.ts\"\n",
+		"relative path":  "pi_extension = \"seed/extensions/herdr-agent-state.ts\"\n",
+		"missing source": "pi_extension = \"/definitely/missing/herdr-agent-state.ts\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Load(write(extension)); err == nil || !strings.Contains(err.Error(), "herdr.pi_extension") {

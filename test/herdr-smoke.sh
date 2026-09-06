@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Real end-to-end proof that a pi job runs through Herdr instead of tmux.
 #
-# It starts its own headless herdr server in a temp HOME, points its own golemd
-# at that session's socket with [herdr], dispatches a trivial pi job against the
+# Its disposable golemd starts and owns a private headless Herdr child, then
+# dispatches a trivial pi job against the
 # cheap local model, follows status through to done, then dispatches a second
 # job and cancels it — asserting the agent and workspace are verifiably gone,
 # that golemd's private tmux server has no sessions for either job, and that
@@ -24,53 +24,33 @@ command -v pi >/dev/null || { echo "pi binary not on PATH" >&2; exit 1; }
 model=${GOLEM_SMOKE_MODEL:-tiamat-openai-llama-frankenstein/Qwen3.8-27B-UD-Q4_K_XL}
 provider=${model%%/*}
 state=$(mktemp -d)
-herdr_home="$state/herdr-home"
+# Keep the session socket below Unix sockaddr_un's ~104-108 byte limit even
+# when nix develop gives $state a long prefix.
+herdr_root=$(mktemp -d /tmp/golem-herdr-smoke-XXXX)
 session=${HERDR_SMOKE_SESSION:-golem-smoke-$$}
-socket="$herdr_home/.config/herdr/sessions/$session/herdr.sock"
-mkdir -p "$herdr_home"
-mkdir -p "$herdr_home/.config/herdr"
-# Install Herdr's Pi lifecycle integration only into an operator-owned seed.
-# Golem must copy it into private worker profiles; Herdr must never install into
-# those job directories after Golem creates them.
-seed="$state/herdr-pi-seed"
-mkdir -m 0700 "$seed"
-HOME="$herdr_home" PI_CODING_AGENT_DIR="$seed" "$herdr_bin" integration install pi
-seed_extension="$seed/extensions/herdr-agent-state.ts"
-[[ -f "$seed_extension" ]] || { echo "Herdr Pi integration did not create $seed_extension" >&2; exit 1; }
-# Operator requirement, learned the hard way (see README "Backends"): the pane
-# shell must not clobber the PATH golemd puts in the workspace env, or Herdr
-# cannot resolve the harness executable. On NixOS an interactive bash
-# re-sources /etc/set-environment and wipes it, so this session's panes use a
-# shell that runs no profile or rc files.
+socket="$herdr_root/config/herdr/sessions/$session/herdr.sock"
+seed_extension="$herdr_root/pi-seed/extensions/herdr-agent-state.ts"
+# Exercise the explicit profile-less shell override used by non-Nix operators.
 cat >"$state/pane-shell" <<'SHELL'
 #!/usr/bin/env bash
 exec bash --norc --noprofile "$@"
 SHELL
 chmod +x "$state/pane-shell"
-cat >"$herdr_home/.config/herdr/config.toml" <<EOF
-[terminal]
-default_shell = "$state/pane-shell"
-EOF
 golemd_pid=
-herdr_pid=
 
-herdrctl() { HOME="$herdr_home" HERDR_SESSION="$session" "$herdr_bin" "$@"; }
+herdrctl() {
+  HOME="$herdr_root/home" XDG_CONFIG_HOME="$herdr_root/config" XDG_STATE_HOME="$herdr_root/state" \
+    HERDR_CONFIG_PATH="$herdr_root/config/herdr/config.toml" HERDR_SESSION="$session" \
+    HERDR_SOCKET_PATH="$socket" "$herdr_bin" --session "$session" "$@"
+}
 cleanup() {
   [[ -n "$golemd_pid" ]] && { kill "$golemd_pid" 2>/dev/null || true; wait "$golemd_pid" 2>/dev/null || true; }
-  herdrctl server stop >/dev/null 2>&1 || true
-  [[ -n "$herdr_pid" ]] && { kill "$herdr_pid" 2>/dev/null || true; wait "$herdr_pid" 2>/dev/null || true; }
   tmux -S "$state/state/tmux.sock" kill-server 2>/dev/null || true
-  rm -rf "$state"
+  rm -rf "$state" "$herdr_root"
 }
 trap cleanup EXIT
 
-echo "--- herdr server ---"
-HOME="$herdr_home" HERDR_SESSION="$session" "$herdr_bin" server >"$state/herdr-server.log" 2>&1 &
-herdr_pid=$!
-for _ in $(seq 1 100); do [[ -S "$socket" ]] && break; sleep 0.1; done
-[[ -S "$socket" ]] || { cat "$state/herdr-server.log"; echo "herdr socket did not appear" >&2; exit 1; }
 "$herdr_bin" --version
-echo "socket: $socket"
 
 go build -o "$state/golemd" ./cmd/golemd
 go build -o "$state/golem" ./cmd/golem
@@ -102,10 +82,13 @@ path = "$project"
 description = "Herdr smoke project"
 
 [herdr]
-socket = "$socket"
+binary = "$herdr_bin"
+root = "$herdr_root"
+session = "$session"
+shell = "$state/pane-shell"
+server_startup_timeout = "15s"
 reconcile_interval = "15s"
 startup_timeout_ms = 120000
-pi_extension = "$seed_extension"
 
 [herdr.kinds]
 pi = "pi"
@@ -120,6 +103,9 @@ for _ in $(seq 1 200); do [[ -S "$gsocket" ]] && break; sleep 0.05; done
 [[ -S "$gsocket" ]] || { cat "$state/golemd.log"; echo "golemd socket did not appear" >&2; exit 1; }
 grep -q 'backend=herdr' "$state/golemd.log" || { cat "$state/golemd.log"; echo "golemd did not select the herdr backend" >&2; exit 1; }
 grep 'run backend selected' "$state/golemd.log"
+[[ -S "$socket" ]] || { cat "$state/golemd.log"; echo "golemd-owned Herdr socket did not appear" >&2; exit 1; }
+[[ -f "$seed_extension" ]] || { cat "$state/golemd.log"; echo "golemd did not install stable Pi lifecycle seed" >&2; exit 1; }
+echo "owned socket: $socket"
 
 cli=("$state/golem" --service "unix://$gsocket")
 
@@ -228,5 +214,19 @@ grep -q '501' <<<"$attach_out" || { echo "attach did not report 501" >&2; exit 1
 grep -q '501' <<<"$steer_out" || { echo "steer did not report 501" >&2; exit 1; }
 grep -q '400' <<<"$claude_out" || { echo "claude dispatch did not report 400" >&2; exit 1; }
 grep -q 'not supported on herdr backend' <<<"$claude_out" || { echo "claude rejection message unclear" >&2; exit 1; }
+
+echo '--- golemd owns Herdr cleanup ---'
+herdr_pid=
+for _ in $(seq 1 100); do
+  herdr_pid=$(sed -n 's/.*private Herdr started.*pid=\([0-9]*\).*/\1/p' "$state/golemd.log" | tail -1)
+  [[ -n "$herdr_pid" ]] && break
+  sleep 0.05
+done
+[[ -n "$herdr_pid" ]] || { cat "$state/golemd.log"; echo "private Herdr pid not logged" >&2; exit 1; }
+kill "$golemd_pid"
+wait "$golemd_pid"
+golemd_pid=
+[[ ! -S "$socket" ]] || { echo "private Herdr socket survived golemd" >&2; exit 1; }
+if kill -0 "$herdr_pid" 2>/dev/null; then echo "private Herdr process survived golemd" >&2; exit 1; fi
 
 echo 'herdr smoke: PASS'

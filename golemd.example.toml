@@ -34,30 +34,24 @@ port = 0
 host_key_path = "/tmp/golemd-attach-host-key"
 authorized_keys_path = "/tmp/golemd-authorized-keys"
 
-# Optional Herdr run substrate. Absent (the default) means golemd's own private
-# tmux server, unchanged. Present means golemd pings this session socket at
-# startup, requires protocol 20, and — if either check fails — logs
-# HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX and comes up on tmux anyway.
-# On this backend only pi runs (other harnesses are 400 at dispatch) and
-# attach/steer are 501; reach a job with `herdr agent attach job-<id>` over SSH.
+# Optional private Herdr substrate. Absent (the default) means golemd's tmux
+# backend. Present makes golemd start, monitor, and stop its own Herdr child;
+# it never attaches to the user's Herdr. Startup failure or protocol mismatch
+# logs HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX. Only pi runs on this
+# backend today; attach/steer are 501.
 # [herdr]
-# session = "golem"              # -> ~/.config/herdr/sessions/golem/herdr.sock
-# socket = ""                    # explicit socket path; wins over session
-# startup_timeout_ms = 60000     # bounds agent.start (3000..300000)
-# reconcile_interval = "15s"     # safety-net agent.list poll
-# pi_extension = "/var/lib/golem/herdr-pi-seed/extensions/herdr-agent-state.ts"
-# [herdr.kinds]                  # golem harness -> herdr agent kind
+# root = "/var/lib/golem/herdr"  # default: STATE/herdr; private XDG/HOME/data
+# binary = "/path/to/herdr"      # default: bundled binary in the Nix package
+# session = "golem"              # explicit private session (default: golem)
+# shell = "/bin/sh"              # must be profile-less; Nix bundles a no-rc bash
+# server_startup_timeout = "15s"
+# startup_timeout_ms = 60000      # bounds agent.start (3000..300000)
+# reconcile_interval = "15s"      # safety-net agent.list poll
+# [herdr.kinds]                    # golem harness -> herdr agent kind
 # pi = "pi"
 #
-# Install the Pi lifecycle extension into a stable seed (never a worker dir):
-# fort-nix (adapt the service owner elsewhere):
-#   sudo install -d -o familiar -g users -m 0700 /var/lib/golem/herdr-pi-seed
-#   sudo -u familiar env PI_CODING_AGENT_DIR=/var/lib/golem/herdr-pi-seed \
-#     herdr integration install pi
-# Then set pi_extension above to the exact resulting path. Golem copies those
-# bytes into each private worker profile and explicitly allowlists that copy.
-# Other Herdr-side requirements: a pinned version and a pane shell that does
-# not replace the PATH golemd puts in the workspace env (Herdr resolves the
-# harness executable through it):
-#   [terminal]
-#   default_shell = "/path/to/a/shell/that/runs/no/profile"
+# Golemd uses the selected binary to install Pi's lifecycle extension once at
+# ROOT/pi-seed, then copies it into every private job profile. Normally there
+# is no pi_extension setting and no manual provisioning. Generated Herdr config
+# enforces a non-login profile-less shell, resume_agents_on_restore=false, and
+# version_check/manifest_check=false.

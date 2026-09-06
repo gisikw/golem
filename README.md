@@ -22,7 +22,7 @@ The run substrate is behind a `Backend` interface (`backend/`): start a harness 
 - **tmux (default, unchanged).** `backend/tmux` is golemd's private tmux server, its pinned policy, keystroke steering, and the host-local `terminal` endpoint that `golem attach` and the SSH attach listener use. This is what runs when `[herdr]` is absent from the config, byte for byte as before.
 - **herdr (opt-in).** `backend/herdr` drives one [Herdr](https://herdr.dev) session on this host over its newline-delimited JSON socket (protocol 20): `workspace.create` → `agent.start --kind pi` → `agent.prompt`, per-pane `events.subscribe` for state plus a 15 s `agent.list` reconcile as the safety net, restart adoption by agent name (`job-<id>`), and cancel as `esc`/`ctrl+c` → `workspace.close` → verified absence of both agent and workspace.
 
-Enable it with a `[herdr]` block (see [`golemd.example.toml`](golemd.example.toml)). At startup golemd pings the socket and requires protocol 20; if the socket is unreachable or speaks anything else it logs `HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX` and comes up on tmux anyway. The selected substrate is logged as `run backend selected backend=…`.
+Enable it with a `[herdr]` block (see [`golemd.example.toml`](golemd.example.toml)). Golemd starts its **own foreground child** in `$STATE/herdr` by default, with explicit `--session`, `HERDR_SESSION`, `HERDR_SOCKET_PATH`, `HERDR_CONFIG_PATH`, private `HOME`/XDG config/state, and a generated config. It never probes, attaches to, or stops the user's Herdr. A second live server in Golem's private namespace is refused rather than adopted. Startup then pings the private socket and requires protocol 20; any child, socket, or protocol failure logs `HERDR BACKEND UNAVAILABLE, FALLING BACK TO TMUX` and comes up on tmux. Graceful golemd shutdown signals only the exact child PID it started. The selected substrate is logged as `run backend selected backend=…`.
 
 On the herdr backend, in this first cut:
 
@@ -30,27 +30,13 @@ On the herdr backend, in this first cut:
 - `attach` and `steer` are `501` with the real route (`herdr agent attach job-<id>` over ordinary SSH); no `terminal`/`activation` is published and the SSH attach listener is not started;
 - questions, answers, artifacts, and settlements are unchanged — they ride pi's existing side channel, not Herdr;
 - state observations map `working`/`idle`/`done` → running, `blocked` → blocked, `unknown` → last known state flagged stale, and `as_of` is golemd's receipt time (Herdr events carry no timestamp and no resumable cursor);
-- Herdr's server is not golemd's to stop, so shutdown leaves live agents alone and re-adopts them by name on the next start.
+- Golemd owns Herdr restart policy: generated config sets `[session] resume_agents_on_restore = false`, so Herdr cannot independently resurrect agents from persisted terminal state. Golem's durable registry and adapter resume path remain authoritative.
 
-Herdr's Pi integration is a lifecycle extension, but Herdr installs it into the `PI_CODING_AGENT_DIR` visible to the install command. Golem workers intentionally use a different, private directory per job. Provision one stable, operator-owned **seed** and point `[herdr].pi_extension` at the installed file:
+At first private-server startup, golemd invokes its selected Herdr binary as `integration install pi` against the stable `$STATE/herdr/pi-seed` profile. It never invokes the installer against a job. Existing seed bytes are deliberately retained across restarts (upgrades therefore require an explicit seed removal/reprovision rollout). On every Pi start or resume, Golem snapshots those bytes to `$ARTIFACT_DIR/pi/extensions/herdr-agent-state.ts` with mode `0600` and names only that private copy in the worker's explicit `settings.json` allowlist. Concurrent workers share neither profile nor extension destination. `pi_extension` remains available only as an absolute, validated expert override.
 
-```sh
-# fort-nix (golemd runs as familiar:users); adapt owner for other deployments:
-sudo install -d -o familiar -g users -m 0700 /var/lib/golem/herdr-pi-seed
-sudo -u familiar env PI_CODING_AGENT_DIR=/var/lib/golem/herdr-pi-seed \
-  herdr integration install pi
-# Installed source consumed by golemd:
-test -f /var/lib/golem/herdr-pi-seed/extensions/herdr-agent-state.ts
-```
+The generated config also sets `shell_mode = "non_login"`, disables version and detection-manifest background checks (`manifest_check = false`), and chooses a profile-less shell so workspace `PATH` survives. The Nix daemon package bundles pinned Herdr 0.8.2 plus a `bash --noprofile --norc` shell and supplies both explicitly; non-Nix runs default to `herdr` on `PATH` and `/bin/sh`, or can set `[herdr].binary` and `[herdr].shell`. `./test/herdr-smoke.sh` proves the owned startup, seed install, private worker copy, real Pi path, cancel, and shutdown cleanup.
 
-```toml
-[herdr]
-pi_extension = "/var/lib/golem/herdr-pi-seed/extensions/herdr-agent-state.ts"
-```
-
-Run the install only against the stable seed, never against a job artifact directory. On every Herdr-backed Pi start, Golem snapshots those exact bytes to `$ARTIFACT_DIR/pi/extensions/herdr-agent-state.ts` with mode `0600` and names only that private copy in the worker's explicit `settings.json` extension allowlist. The seed is never a worker profile, concurrent jobs never share a mutable profile, and Golem never asks Herdr to write a profile after creating it. Config loading rejects a missing/non-regular/non-absolute source; if it disappears later, that worker start fails loudly before settings are written. The default tmux backend does not read or require this setting.
-
-Other Herdr-side requirements are a pinned Herdr version and a pane shell that does not clobber `PATH` (`[terminal] default_shell` — Herdr resolves the harness executable through the pane's `PATH`, and an interactive login shell may replace it with the system default). `./test/herdr-smoke.sh` starts a disposable Herdr server, installs a disposable seed integration, and runs a real Pi job through it.
+Two lifecycle limits are intentional. A hard golemd crash may leave its child alive; the replacement refuses to attach or kill it and loudly falls back until an operator verifies that exact PID (see [`docs/fort-nix-herdr-rollout.md`](docs/fort-nix-herdr-rollout.md)). Also, Herdr's session-derived Unix socket must fit the platform's roughly 104-byte limit, so keep `[herdr].root` and `session` short; golemd rejects paths over 100 bytes before launch. A Herdr child that dies after successful startup is reflected as backend unavailability/job failure, not an automatic mid-run switch to tmux.
 
 ## Requirements
 
@@ -94,7 +80,7 @@ With no `--service`, the CLI uses `unix://~/.local/state/golem/golemd.sock`, mat
 - `clone_enabled` (defaults false)
 - `api_bearer_tokens`: bearer credentials enforced on every TCP request; Unix sockets are exempt
 - `[attach_ssh]`: optional port, host key path, and authorized_keys path (port 0 disables it)
-- `[herdr]`: optional Herdr backend; Herdr-backed Pi requires an absolute `pi_extension` seed path as described above
+- `[herdr]`: optional golemd-owned private Herdr backend; `root`, `binary`, `session`, and profile-less `shell` have safe defaults and `pi_extension` is normally omitted
 
 Project paths and pi provider/model references are validated at startup. Dispatch selects either `--project NAME` or `--repo URL` plus `--worktree NAME`; the resulting `.golem/worktrees/NAME` is reused as the resume key. Repository cloning requires `clone_enabled`. Direct absolute `--cwd` remains a low-level test/fake-harness escape hatch.
 

@@ -53,6 +53,9 @@ type Backend struct {
 	StartupTimeout time.Duration
 	Reconcile      time.Duration
 	Logger         *slog.Logger
+	// Owner is non-nil only for golemd's private child server. Shutdown stops
+	// that exact process; no Herdr CLI stop command or ambient socket is used.
+	Owner interface{ Shutdown(context.Context) error }
 
 	mu       sync.Mutex
 	states   map[string]backend.Status // pane id -> last observation
@@ -552,10 +555,15 @@ func (b *Backend) ServerAlive(ctx context.Context) bool {
 	return err == nil
 }
 
-// Shutdown does nothing on purpose. The Herdr server is one per host, shared,
-// and not golemd's to stop: killing it would take every job on the host with
-// it. Live agents survive a golemd restart and are re-adopted by name.
-func (b *Backend) Shutdown(context.Context) error { return nil }
+// Shutdown stops only the private Herdr child started by this golemd. A
+// backend constructed without an owner (unit tests and legacy callers) never
+// attempts a socket-level stop, so it cannot target an unrelated server.
+func (b *Backend) Shutdown(ctx context.Context) error {
+	if b.Owner == nil {
+		return nil
+	}
+	return b.Owner.Shutdown(ctx)
+}
 
 // Endpoint publishes no host-local terminal: reaching a job is ordinary SSH
 // plus herdr, not a tmux socket Golem hands out.

@@ -39,43 +39,41 @@ type AttachSSH struct {
 	AuthorizedKeysPath string `toml:"authorized_keys_path"`
 }
 
-// Herdr selects the Herdr run substrate. Its absence is the default and means
-// the private tmux server, byte-for-byte as before. Its presence makes golemd
-// check the socket at startup and fall back to tmux, loudly, if the check
-// fails: golemd must come up either way.
+// Herdr selects a private, golemd-owned Herdr run substrate. Its absence is
+// the default and means tmux. Presence starts a foreground Herdr child in an
+// isolated XDG/HOME namespace; startup failure still falls back loudly.
 type Herdr struct {
-	// Socket is an explicit session socket path. When empty it is derived from
-	// Session as ~/.config/herdr/sessions/<session>/herdr.sock.
-	Socket string `toml:"socket"`
-	// Session is the named Herdr session this daemon owns (default "golem").
+	// Binary is the pinned Herdr executable. Empty uses GOLEM_HERDR, then PATH.
+	Binary string `toml:"binary"`
+	// Root is the private Herdr namespace. Empty means STATE/herdr. It contains
+	// XDG config/state, HOME, session data, logs, and the stable Pi seed.
+	Root string `toml:"root"`
+	// Session is explicit even inside the private root (default "golem").
 	Session string `toml:"session"`
+	// Shell is an executable profile-less pane shell. Empty uses
+	// GOLEM_HERDR_SHELL, then /bin/sh; shell_mode is always non_login.
+	Shell string `toml:"shell"`
+	// ServerStartupTimeout is a Go duration bounding child readiness.
+	ServerStartupTimeout string `toml:"server_startup_timeout"`
 	// StartupTimeoutMS bounds agent.start's readiness wait (3000..300000).
 	StartupTimeoutMS int `toml:"startup_timeout_ms"`
 	// ReconcileInterval is the safety-net poll (Go duration, default 15s).
 	ReconcileInterval string `toml:"reconcile_interval"`
-	// PiExtension is the operator-owned herdr-agent-state.ts installed into a
-	// stable seed profile. Golem copies its bytes into each Herdr-backed Pi
-	// worker profile; Herdr never writes job-private profiles itself.
+	// PiExtension optionally overrides the stable seed installed by golemd's
+	// bundled Herdr. Normally empty; the default is ROOT/pi-seed/extensions/
+	// herdr-agent-state.ts. Every worker still receives a private byte copy.
 	PiExtension string `toml:"pi_extension"`
 	// Kinds maps a Golem harness to a Herdr agent kind. Default {pi = "pi"};
 	// every other harness is rejected at dispatch with 400.
 	Kinds map[string]string `toml:"kinds"`
 }
 
-// SocketPath resolves the session socket this daemon must talk to.
-func (h Herdr) SocketPath() (string, error) {
-	if h.Socket != "" {
-		return h.Socket, nil
+// ServerStartup is the parsed child readiness bound; zero means the default.
+func (h Herdr) ServerStartup() (time.Duration, error) {
+	if h.ServerStartupTimeout == "" {
+		return 0, nil
 	}
-	session := h.Session
-	if session == "" {
-		session = "golem"
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".config", "herdr", "sessions", session, "herdr.sock"), nil
+	return time.ParseDuration(h.ServerStartupTimeout)
 }
 
 // Reconcile is the parsed poll interval; zero means the client default.
@@ -186,8 +184,22 @@ func Load(path string) (Config, error) {
 		return Config{}, errors.New("attach_ssh.host_key_path and authorized_keys_path are required when enabled")
 	}
 	if c.Herdr != nil {
-		if _, err = c.Herdr.SocketPath(); err != nil {
-			return Config{}, fmt.Errorf("herdr socket: %w", err)
+		if c.Herdr.Root != "" && !filepath.IsAbs(c.Herdr.Root) {
+			return Config{}, errors.New("herdr.root must be an absolute path")
+		}
+		if c.Herdr.Binary != "" && !filepath.IsAbs(c.Herdr.Binary) {
+			return Config{}, errors.New("herdr.binary must be an absolute path")
+		}
+		if c.Herdr.Shell != "" && !filepath.IsAbs(c.Herdr.Shell) {
+			return Config{}, errors.New("herdr.shell must be an absolute path")
+		}
+		if c.Herdr.Session != "" && !validHerdrSession(c.Herdr.Session) {
+			return Config{}, errors.New("herdr.session must contain only letters, digits, dot, underscore, or hyphen")
+		}
+		if d, parseErr := c.Herdr.ServerStartup(); parseErr != nil {
+			return Config{}, fmt.Errorf("herdr server_startup_timeout: %w", parseErr)
+		} else if d < 0 {
+			return Config{}, errors.New("herdr server_startup_timeout must not be negative")
 		}
 		if _, err = c.Herdr.Reconcile(); err != nil {
 			return Config{}, fmt.Errorf("herdr reconcile_interval: %w", err)
@@ -205,10 +217,7 @@ func Load(path string) (Config, error) {
 		if len(c.Herdr.Kinds) == 0 {
 			piMapped = true // backend/herdr's default mapping is pi -> pi.
 		}
-		if piConfigured && piMapped {
-			if c.Herdr.PiExtension == "" {
-				return Config{}, errors.New("herdr.pi_extension is required when Herdr-backed Pi is configured")
-			}
+		if piConfigured && piMapped && c.Herdr.PiExtension != "" {
 			if !filepath.IsAbs(c.Herdr.PiExtension) {
 				return Config{}, errors.New("herdr.pi_extension must be an absolute path")
 			}
@@ -229,6 +238,18 @@ func Load(path string) (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+func validHerdrSession(s string) bool {
+	if len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if !(r == '-' || r == '_' || r == '.' || r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z') {
+			return false
+		}
+	}
+	return s != "" && s != "default" && s != "." && s != ".."
 }
 
 func validEnvName(s string) bool {
