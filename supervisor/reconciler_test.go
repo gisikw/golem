@@ -97,6 +97,32 @@ func (*restartBackend) Shutdown(context.Context) error                     { ret
 func (*restartBackend) Endpoint(string, string) *protocol.TerminalEndpoint { return nil }
 func (*restartBackend) Policy() backend.Policy                             { return backend.Policy{Name: "herdr"} }
 
+type shutdownRaceBackend struct {
+	alive    bool
+	launches []harnesses.Launch
+}
+
+func (*shutdownRaceBackend) Prepare() error { return nil }
+func (b *shutdownRaceBackend) Start(_ context.Context, _ string, launch harnesses.Launch) (string, string, error) {
+	b.alive = true
+	b.launches = append(b.launches, launch)
+	return "job-shutdown", "w-new:p1", nil
+}
+func (b *shutdownRaceBackend) Has(context.Context, string) bool             { return b.alive }
+func (*shutdownRaceBackend) Teardown(context.Context, string, string) error { return nil }
+func (*shutdownRaceBackend) Cancel(context.Context, string, string) error   { return nil }
+func (*shutdownRaceBackend) Send(context.Context, string, string) error     { return nil }
+func (b *shutdownRaceBackend) Pane(context.Context, string) (bool, *int, error) {
+	return b.alive, nil, nil
+}
+func (b *shutdownRaceBackend) ServerAlive(context.Context) bool { return b.alive }
+func (b *shutdownRaceBackend) Shutdown(context.Context) error {
+	b.alive = false
+	return nil
+}
+func (*shutdownRaceBackend) Endpoint(string, string) *protocol.TerminalEndpoint { return nil }
+func (*shutdownRaceBackend) Policy() backend.Policy                             { return backend.Policy{Name: "herdr"} }
+
 func TestRestartRestoreRehydratesPiArtifactPathsBeforeHerdrStart(t *testing.T) {
 	root, cwd := t.TempDir(), t.TempDir()
 	jobDir := filepath.Join(root, "artifact-restored")
@@ -151,6 +177,141 @@ func TestRestartRestoreRehydratesPiArtifactPathsBeforeHerdrStart(t *testing.T) {
 	persisted := restored.Snapshot()[job.ID]
 	if persisted.Job.Artifacts.Directory != jobDir || persisted.Target != "w-new:p1" {
 		t.Fatalf("rehydrated worker was not persisted: %#v", persisted)
+	}
+}
+
+func TestHerdrBackendShutdownBeforeSignalDoesNotSettleAndRestartResumes(t *testing.T) {
+	ctx := context.Background()
+	signalCtx, cancelSignal := context.WithCancel(ctx)
+	defer cancelSignal()
+	cwd, artifactRoot := t.TempDir(), t.TempDir()
+	s, store, _ := testSupervisor(t, cwd, artifactRoot)
+	registryPath := filepath.Join(t.TempDir(), "workers.json")
+	registry, err := OpenRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Registry = registry
+	oldBackend := &shutdownRaceBackend{alive: true}
+	s.Backend = oldBackend
+	s.Adapters["pi"] = piadapter.Adapter{Binary: "pi"}
+
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "shutdown-race", Harness: "pi", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("shutdown-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job.Artifacts.Directory = filepath.Join(artifactRoot, job.Artifacts.ID)
+	if err = os.MkdirAll(job.Artifacts.Directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	events := filepath.Join(job.Artifacts.Directory, "events.jsonl")
+	shutdownSettlement := `{"type":"settled","verdict":"failed","summary":"worker settled without a non-empty final response"}` + "\n"
+	if err = os.WriteFile(events, []byte(shutdownSettlement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worker := Worker{
+		Job: job, Launch: harnesses.Launch{Session: filepath.Join(job.Artifacts.Directory, "pi-session.jsonl"), Events: events, Dir: cwd},
+		Session: "job-shutdown", Target: "w-old:p1", LastState: protocol.Running,
+		RestartUntil: time.Now().Add(time.Hour), StartedAt: time.Now(),
+	}
+	if err = registry.Put(worker); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the observed systemd ordering: the owned Herdr control group is
+	// already gone while golemd's signal context is still live. The old
+	// pre-cancelled-context regression did not exercise this window.
+	if err = oldBackend.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.observe(signalCtx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State.Terminal() || got.Settlement != nil {
+		t.Fatalf("orderly backend shutdown escaped as terminal settlement: %#v", got)
+	}
+	preserved := registry.Snapshot()[job.ID]
+	if !preserved.SettledAt.IsZero() || preserved.ObservationCursor != int64(len(shutdownSettlement)) {
+		t.Fatalf("shutdown worker/cursor not preserved: %#v", preserved)
+	}
+
+	// Signal delivery catches up only after the terminal observation. There is
+	// no confirming old-daemon reconcile. A fresh daemon must consume the
+	// durable cursor, resume Pi, and leave the service record non-terminal.
+	cancelSignal()
+	if !errors.Is(signalCtx.Err(), context.Canceled) {
+		t.Fatal("test signal context did not cancel")
+	}
+	restored, err := OpenRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBackend := &shutdownRaceBackend{}
+	restarted := &Supervisor{
+		Host: "host", Client: s.Client, Registry: restored, Backend: newBackend,
+		ArtifactRoot: artifactRoot, AllowedCWDRoots: []string{cwd},
+		Adapters: map[string]harnesses.Adapter{"pi": piadapter.Adapter{Binary: "pi"}},
+	}
+	if err = restarted.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(newBackend.launches) != 1 || !newBackend.alive {
+		t.Fatalf("replacement did not resume worker: launches=%d alive=%t", len(newBackend.launches), newBackend.alive)
+	}
+	got, err = store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State.Terminal() || got.Settlement != nil {
+		t.Fatalf("replacement made resumed service terminal: %#v", got)
+	}
+	resumed := restored.Snapshot()[job.ID]
+	if !resumed.SettledAt.IsZero() || resumed.Target != "w-new:p1" {
+		t.Fatalf("replacement did not preserve resumed worker: %#v", resumed)
+	}
+}
+
+func TestHerdrSpontaneousCrashIsFailedAfterConfirmation(t *testing.T) {
+	ctx := context.Background()
+	cwd, artifactRoot := t.TempDir(), t.TempDir()
+	s, store, _ := testSupervisor(t, cwd, artifactRoot)
+	b := &shutdownRaceBackend{}
+	s.Backend = b
+	s.Adapters["pi"] = piadapter.Adapter{}
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "herdr-crash", Harness: "pi", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("herdr-crash-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job.Artifacts.Directory = filepath.Join(artifactRoot, job.Artifacts.ID)
+	if err = s.Registry.Put(Worker{Job: job, Launch: harnesses.Launch{Events: filepath.Join(job.Artifacts.Directory, "events.jsonl")}, Session: "job-crash", Target: "w:p", LastState: protocol.Running}); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.observe(ctx); err != nil { // first observation is intentionally held
+		t.Fatal(err)
+	}
+	if err = s.observe(ctx); err != nil { // daemon stayed up: confirms the crash
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.Failed || got.Settlement == nil {
+		t.Fatalf("confirmed spontaneous crash was not failed: %#v", got)
 	}
 }
 

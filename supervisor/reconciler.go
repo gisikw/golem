@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gisikw/golem/artifacts"
@@ -72,6 +73,14 @@ type Supervisor struct {
 	AttachHost       string
 	AttachPort       int
 	Logger           *slog.Logger
+
+	terminalMu         sync.Mutex
+	terminalCandidates map[string]terminalCandidate
+}
+
+type terminalCandidate struct {
+	target      string
+	observation harnesses.Observation
 }
 
 func (s *Supervisor) log() *slog.Logger {
@@ -164,7 +173,7 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 			_ = s.Registry.Delete(d.Job.ID)
 			continue
 		}
-		if w, ok := local[d.Job.ID]; ok && w.SettledAt.IsZero() && !s.Backend.Has(ctx, w.Session) && d.DesiredState != protocol.Cancelling {
+		if w, ok := local[d.Job.ID]; ok && w.SettledAt.IsZero() && !s.terminalPending(d.Job.ID) && !s.Backend.Has(ctx, w.Session) && d.DesiredState != protocol.Cancelling {
 			s.resumeWorker(ctx, w, "confirmed")
 		}
 	}
@@ -538,17 +547,76 @@ func (s *Supervisor) forget(ctx context.Context, id string) {
 		_ = s.Registry.Delete(id)
 	}
 }
+
+// Herdr's owned server and its agents receive systemd's SIGTERM in the same
+// control group as golemd. The child can therefore disappear (and Pi's Herdr
+// extension can append its shutdown settlement) before Go has delivered the
+// same signal to NotifyContext. A context check alone cannot distinguish that
+// ordering from a spontaneous substrate crash.
+//
+// Hold one terminal observation in daemon-local memory. If golemd remains up,
+// the next reconcile confirms and publishes it, preserving real completions
+// and crashes with one poll of latency. During orderly replacement there is no
+// next reconcile: the durable cursor has consumed the shutdown-only side event,
+// while the deliberately unsettled registry entry is resumed by the new daemon.
+// This is intentionally not persisted; persisting it would turn the old
+// daemon's shutdown evidence into a terminal decision after restart.
+func (s *Supervisor) holdHerdrTerminal(id, target string, obs harnesses.Observation) bool {
+	if s.Backend.Policy().Name != "herdr" {
+		return false
+	}
+	s.terminalMu.Lock()
+	defer s.terminalMu.Unlock()
+	if s.terminalCandidates == nil {
+		s.terminalCandidates = make(map[string]terminalCandidate)
+	}
+	s.terminalCandidates[id] = terminalCandidate{target: target, observation: obs}
+	return true
+}
+
+func (s *Supervisor) herdrTerminal(id, target string) (harnesses.Observation, bool) {
+	s.terminalMu.Lock()
+	defer s.terminalMu.Unlock()
+	candidate, ok := s.terminalCandidates[id]
+	if !ok {
+		return harnesses.Observation{}, false
+	}
+	if candidate.target != target {
+		delete(s.terminalCandidates, id)
+		return harnesses.Observation{}, false
+	}
+	return candidate.observation, true
+}
+
+func (s *Supervisor) terminalPending(id string) bool {
+	s.terminalMu.Lock()
+	defer s.terminalMu.Unlock()
+	_, ok := s.terminalCandidates[id]
+	return ok
+}
+
+func (s *Supervisor) clearTerminal(id string) {
+	s.terminalMu.Lock()
+	defer s.terminalMu.Unlock()
+	delete(s.terminalCandidates, id)
+}
+
 func (s *Supervisor) observe(ctx context.Context) error {
 	for id, w := range s.Registry.Snapshot() {
 		if !w.SettledAt.IsZero() {
+			s.clearTerminal(id)
 			continue
 		}
 		a, err := s.adapter(w.Job.Harness)
 		if err != nil {
 			return err
 		}
-		runtime := s.runtime(w)
-		obs, observeErr := a.Observe(ctx, w.Job, &runtime)
+		obs, confirming := s.herdrTerminal(id, w.Target)
+		var observeErr error
+		if !confirming {
+			runtime := s.runtime(w)
+			obs, observeErr = a.Observe(ctx, w.Job, &runtime)
+		}
 		// Shutdown cancellation is not evidence about the worker. In particular,
 		// the owned Herdr child may disappear while Pane is being observed and
 		// honestly return absent rather than a context error. Preserve resumable
@@ -580,6 +648,7 @@ func (s *Supervisor) observe(ctx context.Context) error {
 		// process exits (State != Running). A dead pane is the supervisor's own
 		// crash boundary handled below.
 		if observeErr == nil && !obs.Settled && obs.State == protocol.Running {
+			s.clearTerminal(id)
 			if w.LastState == protocol.Starting {
 				// Retry the idempotent starting event first: its original response may
 				// have been lost even though the worker was successfully created.
@@ -651,6 +720,10 @@ func (s *Supervisor) observe(ctx context.Context) error {
 			detail, _ := json.Marshal(map[string]string{"failure_boundary": boundary})
 			obs.Detail = detail
 		}
+		if !confirming && s.holdHerdrTerminal(id, w.Target, obs) {
+			s.log().Info("herdr terminal observation awaiting confirmation", "job", id)
+			continue
+		}
 		settlement, err := a.CollectSettlement(ctx, w.Job, w.Launch, obs)
 		if err != nil {
 			return err
@@ -664,6 +737,7 @@ func (s *Supervisor) observe(ctx context.Context) error {
 			return err
 		}
 		s.settleWorker(w, settlement.At, settlement.State)
+		s.clearTerminal(id)
 		if obs.Terminate {
 			// Policy exhaustion is an immediate process boundary, not ordinary
 			// settlement linger. The artifacts/session remain retained by Golem.
