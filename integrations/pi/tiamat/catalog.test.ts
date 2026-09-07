@@ -3,6 +3,7 @@ import {
   catalogToProviderGroups,
   isCatalog,
   isInferenceApi,
+  needsMaxOutputTokensShim,
   etagRequiresFetch,
   withoutMaxOutputTokens,
   type TiamatCatalogRecord,
@@ -87,6 +88,36 @@ describe("Responses compatibility", () => {
   test("leaves unrelated payloads untouched", () => {
     const payload = { model: "gpt-next", stream: true };
     expect(withoutMaxOutputTokens(payload)).toBe(payload);
+  });
+
+  test("shims every Codex-preset Responses provider, however its account is scoped", () => {
+    const codex: TiamatCatalogRecord[] = [
+      // The live router id; the previous predicate missed it entirely.
+      { model: "gpt-5.6-sol", api: "/responses/v1/responses", provider: "codex-personal", fidelity: "native", availability: "available" },
+      { model: "gpt-next", api: "/responses/v1/responses", provider: "codex/personal", fidelity: "native", availability: "available" },
+      { model: "gpt-next", api: "/responses/v1/responses", provider: "codex", fidelity: "native", availability: "available" },
+    ];
+    for (const group of catalogToProviderGroups(codex, "https://router.example")) {
+      expect(needsMaxOutputTokensShim(group)).toBe(true);
+    }
+  });
+
+  test("leaves non-Codex providers and other wires with their token bounds", () => {
+    const others: TiamatCatalogRecord[] = [
+      // A plain OpenAI Responses provider honors max_output_tokens.
+      { model: "gpt-5.6", api: "/responses/v1/responses", provider: "openai-personal", fidelity: "native", availability: "available", max_output_tokens: 32_000 },
+      // Similar-looking id that is not the codex preset.
+      { model: "m", api: "/responses/v1/responses", provider: "codexial", fidelity: "native", availability: "available" },
+      { model: "claude-sonnet", api: "/anthropic/v1/messages", provider: "claude-code-personal", fidelity: "projected", availability: "available" },
+      { model: "qwen", api: "/openai/v1/chat/completions", provider: "codex-adjacent-completions", fidelity: "native", availability: "available" },
+    ];
+    const groups = catalogToProviderGroups(others, "https://router.example");
+    expect(groups).toHaveLength(4);
+    for (const group of groups) {
+      expect(needsMaxOutputTokensShim(group)).toBe(false);
+    }
+    const bounded = groups.find((group) => group.tiamatProvider === "openai-personal")?.models[0];
+    expect(bounded?.maxTokens).toBe(32_000);
   });
 });
 

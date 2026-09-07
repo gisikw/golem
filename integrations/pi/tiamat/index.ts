@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import {
   catalogToProviderGroups,
   isCatalog,
+  needsMaxOutputTokensShim,
   normalizeBaseUrl,
   withoutMaxOutputTokens,
 } from "./catalog.ts";
@@ -39,7 +40,7 @@ export default async function tiamat(pi: ExtensionAPI) {
   const apiKey = `!cat -- ${shellQuote(tokenFile)}`;
   const codexResponsesProviders = new Set<string>();
   for (const group of catalogToProviderGroups(catalog, baseUrl)) {
-    if (group.family === "responses" && (group.tiamatProvider === "codex" || group.tiamatProvider.startsWith("codex/"))) {
+    if (needsMaxOutputTokensShim(group)) {
       codexResponsesProviders.add(group.id);
     }
     pi.registerProvider(group.id, {

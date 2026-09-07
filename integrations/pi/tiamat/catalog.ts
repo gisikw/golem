@@ -141,6 +141,24 @@ export function etagRequiresFetch(status: number, previousEtag: string | undefin
   return !nextEtag || !previousEtag || nextEtag !== previousEtag;
 }
 
+/**
+ * Router provider ids are operator-chosen, but the convention is the OAuth
+ * preset name optionally scoped by an account: `codex`, `codex-personal`
+ * (the live id), or `codex/personal`. Only the Codex preset's Responses
+ * adapter needs the max_output_tokens shim, so match the preset at a
+ * separator boundary rather than any provider whose id merely starts with
+ * those letters, and never every Responses provider (an api-key OpenAI
+ * provider on the same wire honors max_output_tokens).
+ */
+export function isCodexProvider(provider: string): boolean {
+  return provider === "codex" || provider.startsWith("codex-") || provider.startsWith("codex/");
+}
+
+/** Whether a registered provider group needs the Codex Responses shim. */
+export function needsMaxOutputTokensShim(group: Pick<ProviderGroup, "family" | "tiamatProvider">): boolean {
+  return group.family === "responses" && isCodexProvider(group.tiamatProvider);
+}
+
 /** Tiamat's Codex-backed Responses route rejects this standard Responses field. */
 export function withoutMaxOutputTokens(payload: unknown): unknown {
   if (!payload || typeof payload !== "object" || !("max_output_tokens" in payload)) return payload;
