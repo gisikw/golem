@@ -80,3 +80,17 @@ type Status struct {
 type Observer interface {
 	Status(target string) (Status, bool)
 }
+
+// BlockedQuestioner projects an unstructured, substrate-detected blocking UI
+// into a dispatcher-visible question. Structured harness questions continue to
+// come from their adapter side channels.
+type BlockedQuestioner interface {
+	BlockedQuestion(ctx context.Context, target string, harness protocol.HarnessKind) (*protocol.BlockedQuestion, error)
+}
+
+// Answerer is the optional substrate-specific answer path. It lets a backend
+// distinguish a structured next-message answer from a screen dialog that must
+// be handled with deliberate keys. Ordinary steering always uses Backend.Send.
+type Answerer interface {
+	Answer(ctx context.Context, target string, harness protocol.HarnessKind, text string) error
+}

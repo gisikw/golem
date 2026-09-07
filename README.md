@@ -26,9 +26,10 @@ Enable it with a `[herdr]` block (see [`golemd.example.toml`](golemd.example.tom
 
 On the herdr backend, in this first cut:
 
-- only `pi` runs; any other harness is `400 harness "…" not supported on herdr backend` at dispatch;
-- `attach` and `steer` are `501` with the real route (`herdr agent attach job-<id>` over ordinary SSH); no `terminal`/`activation` is published and the SSH attach listener is not started;
-- questions, answers, artifacts, and settlements are unchanged — they ride pi's existing side channel, not Herdr;
+- only harnesses explicitly mapped in `[herdr.kinds]` run (`pi` is the default); others receive `400 harness "…" not supported on herdr backend` at dispatch;
+- `attach` is `501` with the real route (`herdr agent attach job-<id>` over ordinary SSH); no `terminal`/`activation` is published and the SSH attach listener is not started;
+- `/steer` accepts only starting/running jobs, persists input in request order, and delivers it with Herdr `agent.prompt` (which supports working agents); blocked jobs remain `409` and must use `/answer`;
+- Pi questions retain the structured `agents_block` side channel. For configured Claude/other screen-authority agents, a Herdr-detected block emits a bounded detection snapshot explicitly marked `source=screen` and `structured=false`; answers must be deliberate key sequences such as `1 enter`, `down enter`, or `esc` and are sent with `agent.send_keys`, never pasted prose;
 - state observations map `working`/`idle`/`done` → running, `blocked` → blocked, `unknown` → last known state flagged stale, and `as_of` is golemd's receipt time (Herdr events carry no timestamp and no resumable cursor);
 - Golemd owns Herdr restart policy: generated config sets `[session] resume_agents_on_restore = false`, so Herdr cannot independently resurrect agents from persisted terminal state. Golem's durable registry and adapter resume path remain authoritative.
 

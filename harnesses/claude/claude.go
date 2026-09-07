@@ -134,6 +134,9 @@ func (a Adapter) Answer(ctx context.Context, r *harnesses.Runtime, x protocol.An
 	if len(a.ArgvTemplate) > 0 {
 		return a.generic().Answer(ctx, r, x)
 	}
+	if r.AnswerText != nil {
+		return r.AnswerText(ctx, x.Text)
+	}
 	if r.SendText == nil {
 		return harnesses.ErrUnsupported
 	}

@@ -241,6 +241,29 @@ func (c *Conn) AgentPrompt(ctx context.Context, target, text string) error {
 	return c.Call(ctx, "agent.prompt", map[string]any{"target": target, "text": text}, nil)
 }
 
+type ReadResult struct {
+	PaneID    string `json:"pane_id"`
+	Source    string `json:"source"`
+	Text      string `json:"text"`
+	Revision  uint64 `json:"revision"`
+	Truncated bool   `json:"truncated"`
+}
+
+// AgentRead passively reads a bounded terminal snapshot through the live agent
+// identity. Detection is plain text and is the same screen source Herdr uses
+// for manifest classification.
+func (c *Conn) AgentRead(ctx context.Context, target, source string, lines int) (ReadResult, error) {
+	var out struct {
+		Read ReadResult `json:"read"`
+	}
+	params := map[string]any{"target": target, "source": source, "strip_ansi": true}
+	if lines > 0 {
+		params["lines"] = lines
+	}
+	err := c.Call(ctx, "agent.read", params, &out)
+	return out.Read, err
+}
+
 // AgentSendKeys sends validated logical keys ("esc", "ctrl+c").
 func (c *Conn) AgentSendKeys(ctx context.Context, target string, keys ...string) error {
 	return c.Call(ctx, "agent.send_keys", map[string]any{"target": target, "keys": keys}, nil)

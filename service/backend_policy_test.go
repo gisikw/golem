@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -14,8 +15,8 @@ import (
 )
 
 // A substrate that cannot run a harness or proxy a terminal says so on the
-// wire: 400 for the harness, 501 for attach and steer. The zero-value policy
-// (tmux) must keep behaving exactly as before.
+// wire. Herdr still accepts steering because agent.prompt supports working
+// agents. The zero-value policy (tmux) must keep behaving exactly as before.
 func TestBackendPolicyRejectsUnsupportedVerbsAndHarnesses(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "db"))
 	if err != nil {
@@ -27,7 +28,12 @@ func TestBackendPolicyRejectsUnsupportedVerbsAndHarnesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	caps := protocol.Capabilities{Harnesses: map[string]protocol.HarnessCapability{"pi": {}, "claude": {}}}
-	policy := backend.Policy{Name: "herdr", Harnesses: map[string]bool{"pi": true}, NoAttach: true, NoSteer: true}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(context.Background(), protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	policy := backend.Policy{Name: "herdr", Harnesses: map[string]bool{"pi": true}, NoAttach: true}
 	herdrSrv := httptest.NewServer(API{Store: store, Capabilities: caps, Backend: policy}.Handler())
 	defer herdrSrv.Close()
 	tmuxSrv := httptest.NewServer(API{Store: store, Capabilities: caps}.Handler())
@@ -59,8 +65,8 @@ func TestBackendPolicyRejectsUnsupportedVerbsAndHarnesses(t *testing.T) {
 		t.Fatalf("claude dispatch on herdr: %d %s", code, body)
 	}
 	code, body = post(herdrSrv.URL, "/v1/jobs/"+job.ID+"/steer", `{"text":"go left"}`)
-	if code != http.StatusNotImplemented || !strings.Contains(body, "not supported on herdr backend") {
-		t.Fatalf("steer on herdr: %d %s", code, body)
+	if code != http.StatusOK {
+		t.Fatalf("running steer on herdr: %d %s", code, body)
 	}
 	code, body = get(herdrSrv.URL, "/v1/jobs/"+job.ID+"/attach")
 	if code != http.StatusNotImplemented || !strings.Contains(body, "not supported on herdr backend") {

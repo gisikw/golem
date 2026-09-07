@@ -2,15 +2,18 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gisikw/golem/backend"
 	tmuxbackend "github.com/gisikw/golem/backend/tmux"
 	"github.com/gisikw/golem/client"
 	"github.com/gisikw/golem/harnesses"
@@ -35,6 +38,131 @@ func testSupervisor(t *testing.T, cwd, artifactRoot string) (*Supervisor, *servi
 	c := client.New(httpServer.URL)
 	s := &Supervisor{Host: "host", Client: c, Registry: registry, ArtifactRoot: artifactRoot, AllowedCWDRoots: []string{cwd}, Adapters: DefaultAdapters("", nil, nil), MaxStartAttempts: 2, StartBackoff: time.Nanosecond}
 	return s, store, c
+}
+
+type recordingBackend struct {
+	mu       sync.Mutex
+	sent     []string
+	status   backend.Status
+	hasState bool
+	question *protocol.BlockedQuestion
+}
+
+func (*recordingBackend) Prepare() error { return nil }
+func (*recordingBackend) Start(context.Context, string, harnesses.Launch) (string, string, error) {
+	return "agent", "w1:p1", nil
+}
+func (*recordingBackend) Has(context.Context, string) bool               { return true }
+func (*recordingBackend) Teardown(context.Context, string, string) error { return nil }
+func (*recordingBackend) Cancel(context.Context, string, string) error   { return nil }
+func (b *recordingBackend) Send(_ context.Context, _ string, text string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sent = append(b.sent, text)
+	return nil
+}
+func (b *recordingBackend) Answer(_ context.Context, _ string, _ protocol.HarnessKind, text string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sent = append(b.sent, "answer:"+text)
+	return nil
+}
+func (*recordingBackend) Pane(context.Context, string) (bool, *int, error)   { return true, nil, nil }
+func (*recordingBackend) ServerAlive(context.Context) bool                   { return true }
+func (*recordingBackend) Shutdown(context.Context) error                     { return nil }
+func (*recordingBackend) Endpoint(string, string) *protocol.TerminalEndpoint { return nil }
+func (*recordingBackend) Policy() backend.Policy                             { return backend.Policy{Name: "herdr"} }
+func (b *recordingBackend) Status(string) (backend.Status, bool)             { return b.status, b.hasState }
+func (b *recordingBackend) BlockedQuestion(context.Context, string, protocol.HarnessKind) (*protocol.BlockedQuestion, error) {
+	return b.question, nil
+}
+
+func TestScreenDetectedClaudeBlockBecomesDispatcherQuestion(t *testing.T) {
+	ctx := context.Background()
+	cwd, artifacts := t.TempDir(), t.TempDir()
+	s, store, _ := testSupervisor(t, cwd, artifacts)
+	detail := json.RawMessage(`{"source":"screen","structured":false}`)
+	recorder := &recordingBackend{hasState: true, status: backend.Status{State: protocol.Blocked, Present: true, AsOf: time.Now()}, question: &protocol.BlockedQuestion{ID: "screen-1", Prompt: "Allow this command?", At: time.Now(), Detail: detail}}
+	s.Backend = recorder
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "claude-screen-block", Harness: "claude", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("claude-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job, _ = store.Get(ctx, job.ID)
+	if err = s.Registry.Put(Worker{Job: job, Launch: harnesses.Launch{Events: filepath.Join(cwd, "absent-events")}, Session: "agent", Target: "w1:p1", LastState: protocol.Running}); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.observe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, job.ID)
+	if err != nil || got.State != protocol.Blocked || got.Question == nil || got.Question.Prompt != "Allow this command?" {
+		t.Fatalf("screen block was not dispatcher-visible: %#v %v", got, err)
+	}
+	var metadata map[string]any
+	if json.Unmarshal(got.Question.Detail, &metadata) != nil || metadata["source"] != "screen" || metadata["structured"] != false {
+		t.Fatalf("screen block claimed structured semantics: %s", got.Question.Detail)
+	}
+	if _, err = store.Answer(ctx, job.ID, protocol.Answer{IdempotencyKey: "screen-answer", QuestionID: got.Question.ID, Text: "1 enter"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.sent) != 1 || recorder.sent[0] != "answer:1 enter" {
+		t.Fatalf("screen answer did not use backend answer routing exactly once: %v", recorder.sent)
+	}
+}
+
+func TestHerdrStyleSteersDeliverInOrderExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	cwd, artifacts := t.TempDir(), t.TempDir()
+	s, store, _ := testSupervisor(t, cwd, artifacts)
+	recorder := &recordingBackend{}
+	s.Backend = recorder
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "herdr-steer-order", Harness: "fake", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("herdr-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job, _ = store.Get(ctx, job.ID)
+	if err = s.Registry.Put(Worker{Job: job, Launch: harnesses.Launch{}, Session: "agent", Target: "w1:p1", LastState: protocol.Running}); err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"first", "second"} {
+		if _, err = store.Steer(ctx, job.ID, protocol.Steer{Text: text}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if strings.Join(recorder.sent, ",") != "first,second" {
+		t.Fatalf("ordered/idempotent delivery = %v", recorder.sent)
+	}
+	persisted, _ := store.Get(ctx, job.ID)
+	if got := s.Registry.Snapshot()[job.ID].SteeredKey; got != persisted.Steers[1].ID {
+		t.Fatalf("delivery cursor %q, want %q", got, persisted.Steers[1].ID)
+	}
 }
 
 func TestTickDeliversPersistedSteersInOrder(t *testing.T) {

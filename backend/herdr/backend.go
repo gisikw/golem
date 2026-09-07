@@ -2,6 +2,8 @@ package herdr
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -480,24 +482,95 @@ func (b *Backend) Pane(ctx context.Context, target string) (bool, *int, error) {
 	return true, nil, nil
 }
 
-// Send delivers text to the agent as one atomic submitted message. Herdr
-// refuses agent.prompt while it believes the agent sits at an approval dialog;
-// Golem's answers are exactly the text that dialog is waiting for, so the
-// fallback types into the pane and presses Enter instead of giving up.
+// Send is the steering path. Herdr 0.8.2 explicitly accepts agent.prompt for
+// working agents and atomically submits the message. If the agent became
+// blocked after /steer accepted the input, agent_blocked is returned without
+// writing anything; raw dialog input would be unsafe and is never a fallback.
 func (b *Backend) Send(ctx context.Context, target, text string) error {
-	err := b.call(ctx, func(c *Conn) error { return c.AgentPrompt(ctx, target, text) })
-	if !IsCode(err, "agent_blocked") {
+	return b.call(ctx, func(c *Conn) error { return c.AgentPrompt(ctx, target, text) })
+}
+
+// Answer distinguishes Pi's structured next-message block from a Herdr
+// screen-detected dialog. Pi retains its agents_block side channel and needs a
+// submitted user message even while Herdr's lifecycle authority says blocked.
+// Other harnesses receive only an explicit sequence of logical UI keys.
+func (b *Backend) Answer(ctx context.Context, target string, harness protocol.HarnessKind, text string) error {
+	if harness == protocol.HarnessPi {
+		err := b.Send(ctx, target, text)
+		if !IsCode(err, "agent_blocked") {
+			return err
+		}
+		b.log().Info("delivering structured Pi answer through blocked pane", "pane", target)
+		if err = b.call(ctx, func(c *Conn) error {
+			return c.Call(ctx, "pane.send_text", map[string]any{"pane_id": target, "text": text}, nil)
+		}); err != nil {
+			return err
+		}
+		return b.call(ctx, func(c *Conn) error {
+			return c.Call(ctx, "pane.send_keys", map[string]any{"pane_id": target, "keys": []string{"enter"}}, nil)
+		})
+	}
+	keys, err := dialogKeys(text)
+	if err != nil {
 		return err
 	}
-	b.log().Info("herdr agent blocked; delivering text through the pane", "pane", target)
-	if e := b.call(ctx, func(c *Conn) error {
-		return c.Call(ctx, "pane.send_text", map[string]any{"pane_id": target, "text": text}, nil)
-	}); e != nil {
-		return e
+	return b.call(ctx, func(c *Conn) error { return c.AgentSendKeys(ctx, target, keys...) })
+}
+
+func dialogKeys(text string) ([]string, error) {
+	fields := strings.Fields(strings.ToLower(text))
+	if len(fields) == 0 || len(fields) > 4 {
+		return nil, errors.New("screen answer must be 1-4 deliberate keys (for example `1 enter`, `down enter`, or `esc`)")
 	}
-	return b.call(ctx, func(c *Conn) error {
-		return c.Call(ctx, "pane.send_keys", map[string]any{"pane_id": target, "keys": []string{"enter"}}, nil)
+	allowed := map[string]bool{"enter": true, "esc": true, "escape": true, "up": true, "down": true, "left": true, "right": true, "tab": true, "space": true, "y": true, "n": true}
+	for _, key := range fields {
+		if len(key) == 1 && key[0] >= '0' && key[0] <= '9' {
+			continue
+		}
+		if !allowed[key] {
+			return nil, fmt.Errorf("unsafe screen answer %q: use deliberate UI keys such as `1 enter`, `down enter`, or `esc`", text)
+		}
+	}
+	return fields, nil
+}
+
+// BlockedQuestion projects only non-Pi screen-detected blocks. Pi question
+// semantics remain exclusively owned by its structured agents_block channel.
+func (b *Backend) BlockedQuestion(ctx context.Context, target string, harness protocol.HarnessKind) (*protocol.BlockedQuestion, error) {
+	if harness == protocol.HarnessPi {
+		return nil, nil
+	}
+	var read ReadResult
+	err := b.call(ctx, func(c *Conn) error {
+		var e error
+		read, e = c.AgentRead(ctx, target, "detection", 80)
+		return e
 	})
+	if err != nil {
+		return nil, err
+	}
+	text, clipped := boundedRunes(strings.TrimSpace(read.Text), 8192)
+	if text == "" {
+		text = "Herdr detected a blocking approval or question UI, but its bounded detection snapshot was empty."
+	}
+	detail, _ := json.Marshal(map[string]any{
+		"source": "screen", "structured": false, "detector": "herdr",
+		"snapshot_source": "detection", "revision": read.Revision,
+		"truncated": read.Truncated || clipped,
+	})
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", target, read.Revision, text)))
+	return &protocol.BlockedQuestion{
+		ID: "screen-" + hex.EncodeToString(digest[:8]), Prompt: text,
+		At: time.Now().UTC(), Detail: detail,
+	}, nil
+}
+
+func boundedRunes(text string, limit int) (string, bool) {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text, false
+	}
+	return string(runes[:limit]), true
 }
 
 // Cancel is the verified cancellation path from §3.4: esc, ctrl+c, settle
@@ -591,8 +664,8 @@ func (b *Backend) Shutdown(ctx context.Context) error {
 // plus herdr, not a tmux socket Golem hands out.
 func (b *Backend) Endpoint(string, string) *protocol.TerminalEndpoint { return nil }
 
-// Policy restricts this substrate to pi and disables attach and steer, which
-// the API reports as 501 rather than pretending they work.
+// Policy restricts this substrate to explicitly mapped harnesses and disables
+// attach. Steering is supported through agent.prompt for starting/running jobs.
 func (b *Backend) Policy() backend.Policy {
 	harnesses := map[string]bool{}
 	kinds := b.Kinds
@@ -602,10 +675,12 @@ func (b *Backend) Policy() backend.Policy {
 	for golem := range kinds {
 		harnesses[golem] = true
 	}
-	return backend.Policy{Name: "herdr", Harnesses: harnesses, NoAttach: true, NoSteer: true}
+	return backend.Policy{Name: "herdr", Harnesses: harnesses, NoAttach: true}
 }
 
 var (
-	_ backend.Backend  = (*Backend)(nil)
-	_ backend.Observer = (*Backend)(nil)
+	_ backend.Backend           = (*Backend)(nil)
+	_ backend.Observer          = (*Backend)(nil)
+	_ backend.Answerer          = (*Backend)(nil)
+	_ backend.BlockedQuestioner = (*Backend)(nil)
 )

@@ -284,7 +284,8 @@ works and is verified, and tmux is absent from that path.
 
 In scope: pi only; one workspace per job; events by subscription with `as_of = receipt time`;
 reconcile poll as the safety net; questions and artifacts unchanged (they already work off the pi
-side channel and the filesystem); `attach`/`steer` return `501` rather than being fully removed.
+side channel and the filesystem); `attach` returns `501`. The later steering update accepts
+starting/running `/steer` through `agent.prompt` while preserving blocked `/answer` separation (§10).
 Out of scope: claude/codex, PR sketches A–C (assume none of them land), worktree provenance,
 deleting `attachssh` from the tree (just stop starting it).
 
@@ -380,3 +381,22 @@ namespace is not adopted or killed automatically. The replacement daemon
 falls back to tmux until an operator verifies and terminates that exact old
 child. This trades automatic recovery for the stronger guarantee that Golem
 cannot attach to or kill a user's Herdr.
+
+## 10. Steering and screen-block projection update
+
+Herdr 0.8.2's primary `agent-automation` documentation explicitly states that
+`agent prompt` can prompt a working agent and returns `agent_blocked` without
+sending terminal input when already blocked. Golem therefore enables `/steer`
+for starting/running jobs, retains the durable ordered queue and delivery
+cursor, and sends through `agent.prompt`. A race into blocked state fails
+safely; it never falls back to pane text. Blocked jobs remain rejected by
+`/steer` and must use `/answer`.
+
+Pi remains the structured case: `agents_block` JSONL supplies question ID,
+prompt, and options. Its answer is a next user message, so the Pi-only blocked
+fallback may submit pane text plus Enter when Herdr refuses `agent.prompt`.
+Screen-authority agents such as Claude have no equivalent structured question.
+For them Golem passively reads at most 80 lines from `agent.read --source
+detection`, caps text at 8192 runes, and emits it with `source=screen` and
+`structured=false`. Answers accept only short explicit logical key sequences
+(for example `1 enter`, `down enter`, or `esc`) and use `agent.send_keys`.

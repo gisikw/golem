@@ -192,16 +192,25 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 		}
 		answerPending := d.Job.Question != nil && d.Job.Question.Answer != nil && w.AnsweredKey != d.Job.Question.Answer.IdempotencyKey
 		if answerPending {
-			adapter, e := s.adapter(w.Job.Harness)
-			if e == nil {
-				runtime := s.runtime(w)
-				if e = adapter.Answer(ctx, &runtime, *d.Job.Question.Answer); e == nil {
-					w.AnsweredKey = d.Job.Question.Answer.IdempotencyKey
-					answerPending = false
-					_ = s.Registry.Put(w)
-				} else if !errors.Is(e, harnesses.ErrUnsupported) {
-					s.log().Warn("answer delivery failed", "job", w.Job.ID, "error", e)
+			var e error
+			if screenQuestion(d.Job.Question) {
+				if answerer, ok := s.Backend.(backend.Answerer); ok {
+					e = answerer.Answer(ctx, w.Target, w.Job.Harness, d.Job.Question.Answer.Text)
+				} else {
+					e = harnesses.ErrUnsupported
 				}
+			} else if adapter, adapterErr := s.adapter(w.Job.Harness); adapterErr == nil {
+				runtime := s.runtime(w)
+				e = adapter.Answer(ctx, &runtime, *d.Job.Question.Answer)
+			} else {
+				e = adapterErr
+			}
+			if e == nil {
+				w.AnsweredKey = d.Job.Question.Answer.IdempotencyKey
+				answerPending = false
+				_ = s.Registry.Put(w)
+			} else if !errors.Is(e, harnesses.ErrUnsupported) {
+				s.log().Warn("answer delivery failed", "job", w.Job.ID, "error", e)
 			}
 		}
 		if answerPending {
@@ -444,8 +453,25 @@ func (s *Supervisor) sendText(ctx context.Context, w Worker, text string) error 
 	return s.Backend.Send(ctx, w.Target, text)
 }
 
+func screenQuestion(q *protocol.BlockedQuestion) bool {
+	if q == nil || len(q.Detail) == 0 {
+		return false
+	}
+	var detail struct {
+		Source     string `json:"source"`
+		Structured *bool  `json:"structured"`
+	}
+	return json.Unmarshal(q.Detail, &detail) == nil && detail.Source == "screen" && detail.Structured != nil && !*detail.Structured
+}
+
 func (s *Supervisor) runtime(w Worker) harnesses.Runtime {
-	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }, Cancel: func(ctx context.Context) error { return s.Backend.Teardown(ctx, w.Session, w.Target) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Backend.Pane(ctx, w.Target) }}
+	answer := func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }
+	if backendAnswer, ok := s.Backend.(backend.Answerer); ok {
+		answer = func(ctx context.Context, text string) error {
+			return backendAnswer.Answer(ctx, w.Target, w.Job.Harness, text)
+		}
+	}
+	return harnesses.Runtime{Launch: w.Launch, ObservationCursor: w.ObservationCursor, SendText: func(ctx context.Context, text string) error { return s.sendText(ctx, w, text) }, AnswerText: answer, Cancel: func(ctx context.Context) error { return s.Backend.Teardown(ctx, w.Session, w.Target) }, Alive: func(ctx context.Context) (bool, *int, error) { return s.Backend.Pane(ctx, w.Target) }}
 }
 func (s *Supervisor) reapExpired(ctx context.Context, now time.Time) {
 	linger := s.Linger
@@ -532,13 +558,36 @@ func (s *Supervisor) observe(ctx context.Context) error {
 					return err
 				}
 			}
-			// Blocked questions are reported over the side channel; project them so
-			// the operator/operator can answer. Answer delivery happens in Tick.
-			if obs.Question != nil && w.LastState != protocol.Blocked {
-				if err = s.publishBlocked(ctx, &w, obs.Question); err != nil {
+			// Pi questions remain structured side-channel actions. For other
+			// Herdr agents, a screen-detected blocked status is projected from a
+			// bounded passive snapshot and explicitly marked unstructured.
+			question := obs.Question
+			substrateBlocked := false
+			if observer, ok := s.Backend.(backend.Observer); ok {
+				if status, found := observer.Status(w.Target); found && !status.Stale && status.State == protocol.Blocked {
+					substrateBlocked = true
+					if w.Job.Harness != protocol.HarnessPi {
+						// A screen-authority hook notification is not a parsed
+						// question. Use only the honest screen projection here.
+						question = nil
+					}
+					if w.Job.Harness != protocol.HarnessPi && w.LastState != protocol.Blocked {
+						if projector, supported := s.Backend.(backend.BlockedQuestioner); supported {
+							projected, projectErr := projector.BlockedQuestion(ctx, w.Target, w.Job.Harness)
+							if projectErr != nil {
+								s.log().Warn("blocked screen projection failed", "job", w.Job.ID, "error", projectErr)
+							} else if projected != nil {
+								question = projected
+							}
+						}
+					}
+				}
+			}
+			if question != nil && w.LastState != protocol.Blocked {
+				if err = s.publishBlocked(ctx, &w, question); err != nil {
 					return err
 				}
-			} else if obs.Question == nil && w.LastState == protocol.Blocked {
+			} else if question == nil && w.LastState == protocol.Blocked && !substrateBlocked {
 				if err = s.publishState(ctx, &w, protocol.Running); err != nil {
 					return err
 				}

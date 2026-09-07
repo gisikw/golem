@@ -35,8 +35,11 @@ type Runtime struct {
 	Launch            Launch
 	ObservationCursor int64 // durable adapter-specific byte/event cursor
 	SendText          func(context.Context, string) error
-	Cancel            func(context.Context) error
-	Alive             func(context.Context) (bool, *int, error)
+	// AnswerText may use a substrate/harness-specific path for an open
+	// question. It is deliberately separate from steering's SendText.
+	AnswerText func(context.Context, string) error
+	Cancel     func(context.Context) error
+	Alive      func(context.Context) (bool, *int, error)
 }
 
 type Observation struct {

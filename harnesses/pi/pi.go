@@ -543,6 +543,9 @@ func (Adapter) Prompt(ctx context.Context, r *harnesses.Runtime, p string) error
 	return r.SendText(ctx, p)
 }
 func (Adapter) Answer(ctx context.Context, r *harnesses.Runtime, a protocol.Answer) error {
+	if r.AnswerText != nil {
+		return r.AnswerText(ctx, a.Text)
+	}
 	if r.SendText == nil {
 		return harnesses.ErrUnsupported
 	}

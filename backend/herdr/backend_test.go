@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -326,22 +327,85 @@ func TestCancelInterruptsThenClosesAndVerifies(t *testing.T) {
 	}
 }
 
-func TestSendFallsBackToThePaneWhenHerdrThinksTheAgentIsBlocked(t *testing.T) {
+func TestSendUsesAgentPromptForWorkingSteerAndNeverTypesIntoBlockedDialog(t *testing.T) {
+	blocked := false
+	fake := newFakeHerdr(t, func(method string, params map[string]any) (any, *Error) {
+		if method != "agent.prompt" {
+			return nil, &Error{Code: "unexpected", Message: method}
+		}
+		if blocked {
+			return nil, &Error{Code: "agent_blocked", Message: "agent is at an approval dialog"}
+		}
+		return agentInfo("job-abc", "w1:p1", "working"), nil
+	})
+	b := &Backend{Socket: fake.socket}
+	if err := b.Send(context.Background(), "w1:p1", "change direction"); err != nil {
+		t.Fatalf("working steer rejected: %v", err)
+	}
+	blocked = true
+	if err := b.Send(context.Background(), "w1:p1", "unsafe late steer"); !IsCode(err, "agent_blocked") {
+		t.Fatalf("blocked steer should be rejected without fallback: %v", err)
+	}
+	if got := fake.methods(); len(got) != 2 || got[0] != "agent.prompt" || got[1] != "agent.prompt" {
+		t.Fatalf("steer used raw pane interaction: %v", got)
+	}
+}
+
+func TestAnswerRoutesStructuredPiAndUnstructuredScreenDialogsDifferently(t *testing.T) {
 	fake := newFakeHerdr(t, func(method string, params map[string]any) (any, *Error) {
 		switch method {
 		case "agent.prompt":
-			return nil, &Error{Code: "agent_blocked", Message: "agent is at an approval dialog"}
-		case "pane.send_text", "pane.send_keys":
+			return nil, &Error{Code: "agent_blocked", Message: "blocked"}
+		case "pane.send_text", "pane.send_keys", "agent.send_keys":
 			return map[string]any{"type": "ok"}, nil
 		}
 		return nil, &Error{Code: "unexpected", Message: method}
 	})
 	b := &Backend{Socket: fake.socket}
-	if err := b.Send(context.Background(), "w1:p1", "yes"); err != nil {
-		t.Fatalf("answer delivery failed at a blocked dialog: %v", err)
+	if err := b.Answer(context.Background(), "w1:p1", protocol.HarnessPi, "the database is postgres"); err != nil {
+		t.Fatalf("structured Pi answer: %v", err)
 	}
-	if _, ok := fake.call("pane.send_text"); !ok {
-		t.Fatalf("no pane fallback: %v", fake.methods())
+	if err := b.Answer(context.Background(), "w2:p1", protocol.HarnessClaude, "2 enter"); err != nil {
+		t.Fatalf("screen key answer: %v", err)
+	}
+	if err := b.Answer(context.Background(), "w2:p1", protocol.HarnessClaude, "paste this prose"); err == nil {
+		t.Fatal("unsafe prose was pasted into a screen dialog")
+	}
+	keys, ok := fake.call("agent.send_keys")
+	if !ok {
+		t.Fatalf("screen answer did not use agent.send_keys: %v", fake.methods())
+	}
+	got := keys.Params["keys"].([]any)
+	if len(got) != 2 || got[0] != "2" || got[1] != "enter" {
+		t.Fatalf("wrong deliberate key sequence: %v", got)
+	}
+}
+
+func TestBlockedQuestionIsBoundedUnstructuredScreenSnapshot(t *testing.T) {
+	long := strings.Repeat("approval details ", 800)
+	fake := newFakeHerdr(t, func(method string, params map[string]any) (any, *Error) {
+		if method == "agent.read" {
+			if params["source"] != "detection" || params["lines"] != float64(80) {
+				t.Fatalf("unbounded/wrong read params: %v", params)
+			}
+			return map[string]any{"type": "pane_read", "read": map[string]any{"pane_id": "w1:p1", "source": "detection", "text": long, "revision": 42, "truncated": false}}, nil
+		}
+		return nil, &Error{Code: "unexpected", Message: method}
+	})
+	b := &Backend{Socket: fake.socket}
+	if q, err := b.BlockedQuestion(context.Background(), "w1:p1", protocol.HarnessPi); err != nil || q != nil {
+		t.Fatalf("Pi must stay on agents_block side channel: %#v %v", q, err)
+	}
+	q, err := b.BlockedQuestion(context.Background(), "w1:p1", protocol.HarnessClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len([]rune(q.Prompt)) != 8192 || len(q.Options) != 0 || !strings.HasPrefix(q.ID, "screen-") {
+		t.Fatalf("bad bounded question: id=%q runes=%d options=%v", q.ID, len([]rune(q.Prompt)), q.Options)
+	}
+	var detail map[string]any
+	if json.Unmarshal(q.Detail, &detail) != nil || detail["source"] != "screen" || detail["structured"] != false || detail["truncated"] != true {
+		t.Fatalf("dishonest screen detail: %s", q.Detail)
 	}
 }
 
