@@ -45,6 +45,15 @@ func modelPresent(s CapabilitySnapshot, model string) bool {
 	return false
 }
 
+func TestTiamatResolverRejectsUnsafeBaseURLs(t *testing.T) {
+	base := protocol.Capabilities{Harnesses: map[string]protocol.HarnessCapability{"pi": {}}}
+	for _, raw := range []string{"ftp://router.example", "https://user:secret@router.example", "https://router.example?token=secret", "https://router.example/#fragment"} {
+		if _, err := NewDynamicCapabilityResolver(base, nil, TiamatDiscoveryOptions{BaseURL: raw, TokenFile: "/token"}); err == nil {
+			t.Fatalf("unsafe Router URL accepted: %s", raw)
+		}
+	}
+}
+
 func TestTiamatNewModelAppearsAndFilteringRestrictions(t *testing.T) {
 	var body atomic.Value
 	body.Store(`[
@@ -136,8 +145,9 @@ func TestTiamatResolverStaleOutageAndConcurrentRefresh(t *testing.T) {
 		t.Fatalf("unbounded or unclear stale error: %#v", stale.Capabilities.Discovery)
 	}
 	time.Sleep(85 * time.Millisecond)
-	if _, err = resolver.Resolve(context.Background()); err == nil {
-		t.Fatal("expired stale catalogue accepted")
+	expired, err := resolver.Resolve(context.Background())
+	if err != nil || expired.Stale || modelPresent(expired, "tiamat-anthropic-astra/m") || expired.Capabilities.Discovery["tiamat"].Status != "unavailable" {
+		t.Fatalf("expired stale catalogue did not fall back to static capabilities: %#v %v", expired, err)
 	}
 }
 
@@ -155,8 +165,7 @@ func TestDynamicResolverSharedByAdvertisementAndDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	base, _ := resolver.Resolve(context.Background())
-	server := httptest.NewServer(API{Store: store, Capabilities: base.Capabilities, Resolver: resolver}.Handler())
+	server := httptest.NewServer(API{Store: store, Capabilities: resolver.base, PiProviders: resolver.providers, Resolver: resolver}.Handler())
 	defer server.Close()
 	res, err := http.Get(server.URL + "/v1/capabilities")
 	if err != nil {
@@ -187,6 +196,131 @@ func TestDynamicResolverSharedByAdvertisementAndDispatch(t *testing.T) {
 		if got := post(rejected); got != http.StatusUnprocessableEntity {
 			t.Fatalf("rejected model %q status %d", rejected, got)
 		}
+	}
+}
+
+func TestTiamatOutagePreservesStaticCapabilitiesAndDispatch(t *testing.T) {
+	resolver, router := tiamatTestResolver(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "secret backend detail", http.StatusBadGateway)
+	}, nil)
+	defer router.Close()
+	store, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server := httptest.NewServer(API{Store: store, Capabilities: resolver.base, PiProviders: resolver.providers, Resolver: resolver}.Handler())
+	defer server.Close()
+
+	res, err := http.Get(server.URL + "/v1/capabilities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var caps protocol.Capabilities
+	if err = json.NewDecoder(res.Body).Decode(&caps); err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusOK || caps.Discovery["tiamat"].Status != "unavailable" || !contains(caps.Harnesses["pi"].Models, "static/local") {
+		t.Fatalf("outage capabilities: status=%d caps=%#v", res.StatusCode, caps)
+	}
+	post := func(key, harness, model string) int {
+		b, _ := json.Marshal(protocol.CreateJob{IdempotencyKey: key, Harness: protocol.HarnessKind(harness), Model: model, CWD: "/tmp", Prompt: "go"})
+		r, e := http.Post(server.URL+"/v1/jobs", "application/json", bytes.NewReader(b))
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer r.Body.Close()
+		return r.StatusCode
+	}
+	if got := post("static", "pi", "static/local"); got != http.StatusCreated {
+		t.Fatalf("static pi status %d", got)
+	}
+	if got := post("fake", "fake", ""); got != http.StatusCreated {
+		t.Fatalf("fake status %d", got)
+	}
+	if got := post("dynamic", "pi", "tiamat-responses-astra/m"); got != http.StatusUnprocessableEntity {
+		t.Fatalf("unauthorized dynamic status %d", got)
+	}
+}
+
+func TestAcceptedTiamatJobPinsSnapshotAcrossDisappearance(t *testing.T) {
+	var body atomic.Value
+	body.Store(`[{"model":"m/with/slash","api":"/responses/v1/responses","provider":"codex/personal","fidelity":"native","availability":"available","reasoning":true,"thinking_level_map":{"off":null,"high":"high"}}]`)
+	resolver, router := tiamatTestResolver(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body.Load().(string))) }, nil)
+	defer router.Close()
+	store, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	api := API{Store: store, Capabilities: resolver.base, Resolver: resolver}
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+	model := "tiamat-responses-codex%2Fpersonal/m/with/slash"
+	b, _ := json.Marshal(protocol.CreateJob{IdempotencyKey: "pin", Harness: protocol.HarnessPi, Model: model, CWD: "/tmp", Prompt: "go"})
+	res, err := http.Post(server.URL+"/v1/jobs", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var public protocol.Job
+	if err = json.NewDecoder(res.Body).Decode(&public); err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusCreated || public.Tiamat != nil {
+		t.Fatalf("public response leaked provisioning: %#v", public)
+	}
+	body.Store(`[]`)
+	time.Sleep(20 * time.Millisecond)
+	if _, err = resolver.Resolve(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := store.Get(context.Background(), public.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Tiamat == nil || persisted.Tiamat.Provider != "codex/personal" || persisted.Tiamat.Model != "m/with/slash" || persisted.Tiamat.ThinkingLevelMap["off"] != nil {
+		t.Fatalf("authorized snapshot not durable: %#v", persisted.Tiamat)
+	}
+}
+
+func TestTiamatRejectsHeaderUnsafeProviderAndInvalidThinkingMap(t *testing.T) {
+	for _, body := range []string{
+		`[{"model":"m","api":"/responses/v1/responses","provider":"bad\\r\\nx-evil: yes","fidelity":"native","availability":"available"}]`,
+		`[{"model":"m","api":"/responses/v1/responses","provider":"safe","fidelity":"native","availability":"available","thinking_level_map":{"surprise":"high"}}]`,
+		`[{"model":"m","api":"/responses/v1/responses","provider":"safe","fidelity":"native","availability":"available","thinking_level_map":[]}]`,
+	} {
+		resolver, router := tiamatTestResolver(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }, nil)
+		snapshot, err := resolver.Resolve(context.Background())
+		router.Close()
+		if err != nil || snapshot.Capabilities.Discovery["tiamat"].Status != "unavailable" || len(snapshot.TiamatModels) != 0 {
+			t.Fatalf("unsafe catalogue accepted for %s: %#v %v", body, snapshot, err)
+		}
+	}
+}
+
+func TestResolverRefreshSurvivesFirstWaiterCancellation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	resolver, router := tiamatTestResolver(t, func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write([]byte(`[{"model":"m","api":"/anthropic/v1/messages","provider":"p","fidelity":"native","availability":"available"}]`))
+	}, nil)
+	defer router.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := resolver.Resolve(ctx); done <- err }()
+	<-started
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("canceled waiter did not stop waiting")
+	}
+	close(release)
+	snapshot, err := resolver.Resolve(context.Background())
+	if err != nil || !modelPresent(snapshot, "tiamat-anthropic-p/m") {
+		t.Fatalf("shared refresh was canceled: %#v %v", snapshot, err)
 	}
 }
 

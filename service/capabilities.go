@@ -25,6 +25,9 @@ const tiamatCataloguePath = "/tiamat/v1/models"
 type CapabilitySnapshot struct {
 	Capabilities protocol.Capabilities
 	PiProviders  map[string]bool
+	// TiamatModels maps an advertised dynamic model ID to the exact,
+	// credential-free catalogue row that a worker must be provisioned from.
+	TiamatModels map[string]protocol.TiamatProvisioning
 	Stale        bool
 }
 
@@ -58,11 +61,12 @@ type DynamicCapabilityResolver struct {
 	allowedProviders map[string]bool
 	allowedModels    map[string]bool
 
-	mu      sync.Mutex
-	cached  *CapabilitySnapshot
-	fetched time.Time
-	refresh chan struct{}
-	lastErr string
+	mu        sync.Mutex
+	cached    *CapabilitySnapshot
+	fetched   time.Time
+	attempted time.Time
+	refresh   chan struct{}
+	lastErr   string
 }
 
 func NewDynamicCapabilityResolver(base protocol.Capabilities, staticProviders map[string]bool, opts TiamatDiscoveryOptions) (*DynamicCapabilityResolver, error) {
@@ -73,8 +77,8 @@ func NewDynamicCapabilityResolver(base protocol.Capabilities, staticProviders ma
 	if opts.BaseURL == "" || opts.TokenFile == "" {
 		return nil, errors.New("tiamat discovery requires GOLEM_TIAMAT_URL and GOLEM_TIAMAT_TOKEN_FILE")
 	}
-	if u, err := url.Parse(opts.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, errors.New("GOLEM_TIAMAT_URL must be an absolute HTTP(S) URL")
+	if u, err := url.Parse(opts.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("GOLEM_TIAMAT_URL must be an absolute HTTP(S) URL without userinfo, query, or fragment")
 	}
 	if opts.CacheTTL <= 0 {
 		opts.CacheTTL = 30 * time.Second
@@ -133,41 +137,53 @@ func (r *DynamicCapabilityResolver) Resolve(ctx context.Context) (CapabilitySnap
 			r.mu.Unlock()
 			return s, nil
 		}
-		if wait := r.refresh; wait != nil {
+		if !r.attempted.IsZero() && now.Sub(r.attempted) <= r.opts.CacheTTL {
+			s := r.fallbackLocked(now)
 			r.mu.Unlock()
-			select {
-			case <-wait:
-				continue
-			case <-ctx.Done():
-				return CapabilitySnapshot{}, ctx.Err()
-			}
+			return s, nil
 		}
-		wait := make(chan struct{})
-		r.refresh = wait
-		r.mu.Unlock()
-
-		snapshot, err := r.fetch(ctx)
-		r.mu.Lock()
-		if err == nil {
-			r.cached, r.fetched, r.lastErr = &snapshot, time.Now(), ""
-		} else {
-			r.lastErr = err.Error()
-		}
-		close(wait)
-		r.refresh = nil
-		if err != nil && r.cached != nil && time.Since(r.fetched) <= r.opts.StaleTTL {
-			stale := cloneSnapshot(*r.cached)
-			stale.Stale = true
-			stale.Capabilities.Discovery = map[string]protocol.DiscoveryStatus{"tiamat": {Status: "stale", RefreshedAt: r.fetched, Error: r.lastErr}}
-			r.mu.Unlock()
-			return stale, nil
+		wait := r.refresh
+		if wait == nil {
+			wait = make(chan struct{})
+			r.refresh = wait
+			// Refresh lifetime belongs to the resolver, not whichever HTTP caller
+			// happened to miss the cache first.
+			go r.refreshCatalogue(wait)
 		}
 		r.mu.Unlock()
-		if err != nil {
-			return CapabilitySnapshot{}, fmt.Errorf("tiamat catalogue unavailable: %w", err)
+		select {
+		case <-wait:
+			continue
+		case <-ctx.Done():
+			return CapabilitySnapshot{}, ctx.Err()
 		}
-		return cloneSnapshot(snapshot), nil
 	}
+}
+
+func (r *DynamicCapabilityResolver) refreshCatalogue(wait chan struct{}) {
+	snapshot, err := r.fetch()
+	r.mu.Lock()
+	r.attempted = time.Now()
+	if err == nil {
+		r.cached, r.fetched, r.lastErr = &snapshot, r.attempted, ""
+	} else {
+		r.lastErr = err.Error()
+	}
+	close(wait)
+	r.refresh = nil
+	r.mu.Unlock()
+}
+
+func (r *DynamicCapabilityResolver) fallbackLocked(now time.Time) CapabilitySnapshot {
+	if r.cached != nil && now.Sub(r.fetched) <= r.opts.StaleTTL {
+		stale := cloneSnapshot(*r.cached)
+		stale.Stale = true
+		stale.Capabilities.Discovery = map[string]protocol.DiscoveryStatus{"tiamat": {Status: "stale", RefreshedAt: r.fetched, Error: r.lastErr}}
+		return stale
+	}
+	caps := cloneCapabilities(r.base)
+	caps.Discovery = map[string]protocol.DiscoveryStatus{"tiamat": {Status: "unavailable", Error: r.lastErr}}
+	return CapabilitySnapshot{Capabilities: caps, PiProviders: cloneBools(r.providers)}
 }
 
 type tiamatRecord struct {
@@ -190,8 +206,8 @@ var tiamatFamilies = map[string]string{
 	"/responses/v1/responses":     "responses",
 }
 
-func (r *DynamicCapabilityResolver) fetch(parent context.Context) (CapabilitySnapshot, error) {
-	ctx, cancel := context.WithTimeout(parent, r.opts.Timeout)
+func (r *DynamicCapabilityResolver) fetch() (CapabilitySnapshot, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), r.opts.Timeout)
 	defer cancel()
 	token, err := os.ReadFile(r.opts.TokenFile)
 	if err != nil {
@@ -233,13 +249,14 @@ func (r *DynamicCapabilityResolver) fetch(parent context.Context) (CapabilitySna
 	}
 
 	models := make(map[string]bool)
+	dynamic := make(map[string]protocol.TiamatProvisioning)
 	providers := cloneBools(r.providers)
 	for _, record := range records {
 		family, supported := tiamatFamilies[record.API]
 		if !supported {
 			continue
 		} // Match the worker: new wire families are ignored.
-		if record.Model == "" || record.Provider == "" || record.Fidelity == "" || !validAvailability(record.Availability) || !validMetadata(record) {
+		if !safeIdentifier(record.Model) || !safeHeaderValue(record.Provider) || record.Fidelity == "" || !validAvailability(record.Availability) || !validMetadata(record) {
 			return CapabilitySnapshot{}, errors.New("catalogue response has an invalid shape")
 		}
 		if record.Availability == "unavailable" {
@@ -254,6 +271,15 @@ func (r *DynamicCapabilityResolver) fetch(parent context.Context) (CapabilitySna
 			continue
 		}
 		models[model], providers[provider] = true, true
+		if _, exists := dynamic[model]; !exists {
+			dynamic[model] = protocol.TiamatProvisioning{
+				Model: record.Model, API: record.API, Provider: record.Provider,
+				Fidelity: record.Fidelity, Availability: record.Availability,
+				ContextWindow: decodeInt(record.ContextWindow), MaxOutputTokens: decodeInt(record.MaxOutputTokens),
+				Reasoning: decodeBool(record.Reasoning), Input: decodeStrings(record.Input),
+				ThinkingLevelMap: decodeThinkingMap(record.ThinkingLevelMap), ForceAdaptiveThinking: decodeBool(record.ForceAdaptiveThinking),
+			}
+		}
 		if len(models) > r.opts.MaxModels {
 			return CapabilitySnapshot{}, errors.New("catalogue exceeds configured model limit")
 		}
@@ -272,7 +298,34 @@ func (r *DynamicCapabilityResolver) fetch(parent context.Context) (CapabilitySna
 	caps.Harnesses[string(protocol.HarnessPi)] = pi
 	now := time.Now().UTC()
 	caps.Discovery = map[string]protocol.DiscoveryStatus{"tiamat": {Status: "fresh", RefreshedAt: now}}
-	return CapabilitySnapshot{Capabilities: caps, PiProviders: providers}, nil
+	return CapabilitySnapshot{Capabilities: caps, PiProviders: providers, TiamatModels: dynamic}, nil
+}
+
+func safeIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, b := range []byte(s) {
+		if b < 0x20 || b == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// Provider is emitted as x-tiamat-provider by the worker. Reject whitespace,
+// controls and DEL here rather than relying on a particular fetch runtime's
+// header validation.
+func safeHeaderValue(s string) bool {
+	if !safeIdentifier(s) {
+		return false
+	}
+	for _, b := range []byte(s) {
+		if b < 0x21 || b > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func validAvailability(s string) bool {
@@ -294,14 +347,15 @@ func validMetadata(r tiamatRecord) bool {
 		}
 	}
 	if r.ThinkingLevelMap != nil {
-		var value any
+		var value map[string]*string
 		if json.Unmarshal(r.ThinkingLevelMap, &value) != nil || value == nil {
 			return false
 		}
-		switch value.(type) {
-		case map[string]any, []any:
-		default:
-			return false
+		allowed := map[string]bool{"off": true, "minimal": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+		for key := range value {
+			if !allowed[key] {
+				return false
+			}
 		}
 	}
 	return true
@@ -318,6 +372,43 @@ func optionalPositiveInteger(raw json.RawMessage) bool {
 	number, ok := value.(float64)
 	return ok && number > 0 && number == float64(int64(number))
 }
+func decodeInt(raw json.RawMessage) *int64 {
+	if raw == nil {
+		return nil
+	}
+	var value int64
+	if json.Unmarshal(raw, &value) != nil {
+		return nil
+	}
+	return &value
+}
+func decodeBool(raw json.RawMessage) *bool {
+	if raw == nil {
+		return nil
+	}
+	var value bool
+	if json.Unmarshal(raw, &value) != nil {
+		return nil
+	}
+	return &value
+}
+func decodeStrings(raw json.RawMessage) []string {
+	if raw == nil {
+		return nil
+	}
+	var value []string
+	_ = json.Unmarshal(raw, &value)
+	return value
+}
+func decodeThinkingMap(raw json.RawMessage) map[string]*string {
+	if raw == nil {
+		return nil
+	}
+	var value map[string]*string
+	_ = json.Unmarshal(raw, &value)
+	return value
+}
+
 func optionalBool(raw json.RawMessage) bool {
 	if raw == nil {
 		return true
@@ -372,5 +463,12 @@ func cloneBools(in map[string]bool) map[string]bool {
 func cloneSnapshot(in CapabilitySnapshot) CapabilitySnapshot {
 	in.Capabilities = cloneCapabilities(in.Capabilities)
 	in.PiProviders = cloneBools(in.PiProviders)
+	if in.TiamatModels != nil {
+		out := make(map[string]protocol.TiamatProvisioning, len(in.TiamatModels))
+		for k, v := range in.TiamatModels {
+			out[k] = v
+		}
+		in.TiamatModels = out
+	}
 	return in
 }

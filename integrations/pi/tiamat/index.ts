@@ -1,14 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import {
-  isInferenceApi,
   catalogToProviderGroups,
   isCatalog,
   normalizeBaseUrl,
   withoutMaxOutputTokens,
 } from "./catalog.ts";
-
-const CATALOG_PATH = "/tiamat/v1/models";
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
@@ -22,38 +19,35 @@ function shellQuote(value: string): string {
 export default async function tiamat(pi: ExtensionAPI) {
   const configuredUrl = process.env.GOLEM_TIAMAT_URL;
   const tokenFile = process.env.GOLEM_TIAMAT_TOKEN_FILE;
-  if (!configuredUrl || !tokenFile) {
-    console.error("[golem-tiamat] GOLEM_TIAMAT_URL and GOLEM_TIAMAT_TOKEN_FILE are required");
+  const snapshotFile = process.env.GOLEM_TIAMAT_SNAPSHOT_FILE;
+  if (!configuredUrl || !tokenFile || !snapshotFile) {
+    console.error("[golem-tiamat] URL, token file, and authorized snapshot are required");
     return;
   }
 
   const baseUrl = normalizeBaseUrl(configuredUrl);
-  const token = (await readFile(tokenFile, "utf8")).trim();
-  if (!token) throw new Error("Golem Tiamat token file is empty");
-  const response = await fetch(`${baseUrl}${CATALOG_PATH}`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!response.ok) throw new Error(`Golem Tiamat catalog returned HTTP ${response.status}`);
-  const raw: unknown = await response.json();
-  // Records for wires this extension doesn't speak (the router grew a speech
-  // family; more may follow) are not an invalid catalogue — they're just not
-  // for pi. Drop them before validating, so an unknown api can never take
-  // dispatch down.
-  const catalog: unknown = Array.isArray(raw)
-    ? raw.filter((record) => record && typeof record === "object" && isInferenceApi((record as { api?: unknown }).api))
-    : raw;
-  if (!isCatalog(catalog)) throw new Error("Golem Tiamat catalog response has an invalid shape");
+  // This is the exact credential-free row authorized with the durable job.
+  // Never perform independent live discovery here: removal after acceptance
+  // must not change provider construction or resume behavior.
+  const catalog: unknown = JSON.parse(await readFile(snapshotFile, "utf8"));
+  if (!isCatalog(catalog) || catalog.length !== 1) {
+    throw new Error("Golem Tiamat authorized snapshot has an invalid shape");
+  }
 
   // Pi resolves this command for each request. The token itself therefore
   // never enters settings.json, models.json, a job record, or an artifact.
   const apiKey = `!cat -- ${shellQuote(tokenFile)}`;
+  const codexResponsesProviders = new Set<string>();
   for (const group of catalogToProviderGroups(catalog, baseUrl)) {
+    if (group.family === "responses" && (group.tiamatProvider === "codex" || group.tiamatProvider.startsWith("codex/"))) {
+      codexResponsesProviders.add(group.id);
+    }
     pi.registerProvider(group.id, {
       name: group.name,
       baseUrl: group.baseUrl,
       apiKey,
       authHeader: true,
+      headers: { "x-tiamat-provider": group.tiamatProvider },
       api: group.api,
       models: group.models,
     });
@@ -62,7 +56,7 @@ export default async function tiamat(pi: ExtensionAPI) {
   // Codex's Router adapter rejects the standard Responses max_output_tokens
   // field. Preserve the same compatibility shim used by resident Familiar.
   pi.on("before_provider_request", (event, ctx) => {
-    if (!ctx.model?.provider.startsWith("tiamat-responses-")) return;
+    if (!ctx.model || !codexResponsesProviders.has(ctx.model.provider)) return;
     return withoutMaxOutputTokens(event.payload);
   });
 }

@@ -25,7 +25,10 @@ models = ["openai/gpt-5.6"]
 # in this file. Empty providers/models lists allow all compatible available or
 # degraded entries. providers are Router provider names; models are exact
 # advertised tiamat-{family}-{encoded-provider}/{model} IDs. Both restrictions,
-# when present, must match.
+# when present, must match. Outage never blocks static harnesses; stale dynamic
+# rows remain selectable only through stale_ttl and are pinned per accepted job.
+# Workers route on unscoped API URLs with the raw provider in the validated
+# x-tiamat-provider header; token contents are never serialized.
 # [tiamat]
 # providers = ["astra/personal"]
 # models = []

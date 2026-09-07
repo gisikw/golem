@@ -57,16 +57,32 @@ export function isCatalog(value: unknown): value is TiamatCatalogRecord[] {
   return value.every((record) => {
     if (!record || typeof record !== "object") return false;
     const item = record as Record<string, unknown>;
-    return typeof item.model === "string" && typeof item.provider === "string" &&
+    return typeof item.model === "string" && safeModel(item.model) &&
+      typeof item.provider === "string" && safeHeaderValue(item.provider) &&
       typeof item.fidelity === "string" && item.api in WIRES &&
       ["available", "degraded", "unavailable"].includes(String(item.availability)) &&
       (item.context_window === undefined || (Number.isInteger(item.context_window) && Number(item.context_window) > 0)) &&
       (item.max_output_tokens === undefined || (Number.isInteger(item.max_output_tokens) && Number(item.max_output_tokens) > 0)) &&
       (item.reasoning === undefined || typeof item.reasoning === "boolean") &&
       (item.input === undefined || (Array.isArray(item.input) && item.input.every((value) => value === "text" || value === "image"))) &&
-      (item.thinking_level_map === undefined || (item.thinking_level_map !== null && typeof item.thinking_level_map === "object")) &&
+      (item.thinking_level_map === undefined || isThinkingLevelMap(item.thinking_level_map)) &&
       (item.force_adaptive_thinking === undefined || typeof item.force_adaptive_thinking === "boolean");
   });
+}
+
+function safeModel(value: string): boolean {
+  return value.length > 0 && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function safeHeaderValue(value: string): boolean {
+  return value.length > 0 && /^[\u0021-\u007e]+$/.test(value);
+}
+
+function isThinkingLevelMap(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const levels = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  return Object.entries(value as Record<string, unknown>)
+    .every(([key, mapped]) => levels.has(key) && (mapped === null || typeof mapped === "string"));
 }
 
 /**
@@ -82,24 +98,29 @@ export function catalogToProviderGroups(catalog: TiamatCatalogRecord[], rawBaseU
     const id = `tiamat-${wire.family}-${encodeURIComponent(record.provider)}`;
     let group = groups.get(id);
     if (!group) {
-      const scopedBase = `${base}/${wire.family}/${encodeURIComponent(record.provider)}${wire.baseSuffix}`;
+      // Provider selection belongs in the raw header. A percent-encoded slash
+      // in a URL path is decoded by Go net/http before Router parses segments.
+      const unscopedBase = `${base}/${wire.family}${wire.baseSuffix}`;
       group = {
         id,
         name: `Tiamat ${wire.family} (${record.provider})`,
         api: wire.api,
-        baseUrl: scopedBase,
+        baseUrl: unscopedBase,
         family: wire.family,
         tiamatProvider: record.provider,
         models: [],
       };
       groups.set(id, group);
     }
+    // Duplicate Router rows must not produce duplicate Pi model entries. The
+    // resolver and worker both keep the first supported row.
+    if (group.models.some((model) => model.id === record.model)) continue;
     group.models.push({
       id: record.model,
       name: `${record.model} via ${record.provider}${record.availability === "degraded" ? " (degraded)" : ""}`,
       baseUrl: group.baseUrl,
       reasoning: record.reasoning ?? false,
-      input: record.input?.length ? record.input : ["text"],
+      input: record.input ?? ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: record.context_window ?? 128_000,
       maxTokens: record.max_output_tokens ?? 16_384,

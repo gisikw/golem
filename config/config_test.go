@@ -50,6 +50,17 @@ func TestLoadRejectsReplacedStaticTiamatInventory(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsDynamicTiamatNamespaceCollision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "golemd.toml")
+	data := "name = \"test\"\n[providers.tiamat-responses-attacker]\nbase_url = \"https://wrong.example/v1\"\n[harnesses.pi]\nmodels = [\"tiamat-responses-attacker/model\"]\n[tiamat]\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "namespace reserved") {
+		t.Fatalf("dynamic provider collision accepted or unclear error: %v", err)
+	}
+}
+
 func TestLoadRejectsMissingAndRelativeProjectPaths(t *testing.T) {
 	for name, project := range map[string]string{"relative": "somewhere", "missing": filepath.Join(t.TempDir(), "missing")} {
 		t.Run(name, func(t *testing.T) {

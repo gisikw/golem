@@ -87,7 +87,7 @@ func (s *Store) Create(ctx context.Context, c protocol.CreateJob) (protocol.Job,
 	// Artifact identity is global semantic metadata; host-local paths are
 	// deliberately resolved by the assigned supervisor.
 	artifacts := protocol.ArtifactMetadata{ID: id, RetentionDays: c.Artifacts.RetentionDays, Labels: c.Artifacts.Labels}
-	j := protocol.Job{ID: id, IdempotencyKey: c.IdempotencyKey, Harness: c.Harness, Model: c.Model, CWD: c.CWD, Workspace: c.ResolvedWorkspace, Prompt: c.Prompt, Artifacts: artifacts, Host: c.Host, State: protocol.Assigned, CreatedAt: now, UpdatedAt: now}
+	j := protocol.Job{ID: id, IdempotencyKey: c.IdempotencyKey, Harness: c.Harness, Model: c.Model, Tiamat: c.Tiamat, CWD: c.CWD, Workspace: c.ResolvedWorkspace, Prompt: c.Prompt, Artifacts: artifacts, Host: c.Host, State: protocol.Assigned, CreatedAt: now, UpdatedAt: now}
 	body, _ := json.Marshal(j)
 	tx, txErr := s.db.BeginTx(ctx, nil)
 	if txErr != nil {

@@ -292,7 +292,7 @@ func TestDynamicTiamatProviderReachesWorker(t *testing.T) {
 	a := Adapter{Binary: "fake-pi", Tiamat: true, Env: map[string]string{
 		"GOLEM_TIAMAT_URL": "https://router.example", "GOLEM_TIAMAT_TOKEN_FILE": "/run/secrets/router-token",
 	}}
-	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Model: "tiamat-responses-astra%2Fnew/gpt-astra", Artifacts: protocol.ArtifactMetadata{Directory: dir}}
+	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Model: "tiamat-responses-astra%2Fnew/gpt-astra", Tiamat: &protocol.TiamatProvisioning{Model: "gpt-astra", API: "/responses/v1/responses", Provider: "astra/new", Fidelity: "native", Availability: "available"}, Artifacts: protocol.ArtifactMetadata{Directory: dir}}
 	launch, err := a.Start(context.Background(), j)
 	if err != nil {
 		t.Fatal(err)
@@ -314,8 +314,17 @@ func TestDynamicTiamatProviderReachesWorker(t *testing.T) {
 	if len(got.Enabled) != 1 || got.Enabled[0] != j.Model {
 		t.Fatalf("dynamic model not enabled: %#v", got.Enabled)
 	}
-	if launch.Env["GOLEM_TIAMAT_TOKEN_FILE"] != "/run/secrets/router-token" || strings.Contains(string(settings), "router-token") {
-		t.Fatal("router token path leaked or was not isolated in environment")
+	if launch.Env["GOLEM_TIAMAT_TOKEN_FILE"] != "/run/secrets/router-token" || launch.Env[TiamatSnapshotEnv] == "" || strings.Contains(string(settings), "router-token") {
+		t.Fatal("router token path leaked or authorized snapshot was not isolated in environment")
+	}
+	snapshot, err := os.ReadFile(launch.Env[TiamatSnapshotEnv])
+	if err != nil || !strings.Contains(string(snapshot), `"provider": "astra/new"`) || strings.Contains(string(snapshot), "router-token") {
+		t.Fatalf("bad credential-free snapshot: %s %v", snapshot, err)
+	}
+	// Resume rebuilds from durable job metadata and the accepted snapshot; it
+	// has no live-catalogue fetch that can fail after the model disappears.
+	if _, err = a.Resume(context.Background(), j, launch); err != nil {
+		t.Fatalf("dynamic resume: %v", err)
 	}
 }
 
@@ -331,7 +340,7 @@ func TestTiamatProviderUsesEmbeddedExtensionWithoutWorkerCredentials(t *testing.
 			"GOLEM_TIAMAT_TOKEN_FILE": "/run/secrets/router-token",
 		},
 	}
-	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Model: "tiamat-responses-codex-personal/gpt-5.6-sol", Artifacts: protocol.ArtifactMetadata{Directory: dir}}
+	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Model: "tiamat-responses-codex-personal/gpt-5.6-sol", Tiamat: &protocol.TiamatProvisioning{Model: "gpt-5.6-sol", API: "/responses/v1/responses", Provider: "codex-personal", Fidelity: "native", Availability: "available"}, Artifacts: protocol.ArtifactMetadata{Directory: dir}}
 	launch, err := a.Start(context.Background(), j)
 	if err != nil {
 		t.Fatal(err)

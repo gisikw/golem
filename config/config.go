@@ -210,6 +210,11 @@ func Load(path string) (Config, error) {
 		if c.Tiamat.MaxResponseBytes < 0 || c.Tiamat.MaxResponseBytes > 16<<20 {
 			return Config{}, errors.New("tiamat max_response_bytes must not exceed 16777216")
 		}
+		for name := range c.Providers {
+			if dynamicTiamatProviderName(name) {
+				return Config{}, fmt.Errorf("provider %q uses a namespace reserved by dynamic [tiamat] discovery", name)
+			}
+		}
 		for field, values := range map[string][]string{"providers": c.Tiamat.Providers, "models": c.Tiamat.Models} {
 			seen := map[string]bool{}
 			for _, value := range values {
@@ -312,6 +317,15 @@ func validHerdrSession(s string) bool {
 		}
 	}
 	return s != "" && s != "default" && s != "." && s != ".."
+}
+
+func dynamicTiamatProviderName(value string) bool {
+	for _, family := range []string{"anthropic", "openai", "responses"} {
+		if strings.HasPrefix(value, "tiamat-"+family+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 func validEnvName(s string) bool {
