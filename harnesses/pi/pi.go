@@ -170,6 +170,11 @@ func writeTaskContext(j protocol.Job) (string, error) {
 	if err = os.WriteFile(p, b, 0o600); err != nil {
 		return "", err
 	}
+	// WriteFile preserves an existing file's mode. Reassert the private context
+	// boundary on every start/resume rather than trusting historical metadata.
+	if err = os.Chmod(p, 0o600); err != nil {
+		return "", err
+	}
 	return p, nil
 }
 
@@ -471,9 +476,12 @@ func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (
 	if l.Session == "" {
 		return harnesses.Launch{}, errors.New("pi resume requires session")
 	}
-	if l.Events == "" {
-		_, _, l.Events = paths(j)
-	}
+	// Launch is durable registry data, but all artifact paths are derived from
+	// the supervisor-rehydrated job directory. Re-derive them rather than
+	// retaining a historical relative path whose meaning changes with golemd's
+	// cwd (or Herdr's workspace cwd).
+	l.Session, l.Transcript, l.Events = paths(j)
+	l.Dir = j.CWD
 	wd := workerDir(j)
 	taskContext, err := writeTaskContext(j)
 	if err != nil {

@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -75,6 +76,102 @@ func (*recordingBackend) Policy() backend.Policy                             { r
 func (b *recordingBackend) Status(string) (backend.Status, bool)             { return b.status, b.hasState }
 func (b *recordingBackend) BlockedQuestion(context.Context, string, protocol.HarnessKind) (*protocol.BlockedQuestion, error) {
 	return b.question, nil
+}
+
+type restartBackend struct {
+	launches []harnesses.Launch
+}
+
+func (*restartBackend) Prepare() error { return nil }
+func (b *restartBackend) Start(_ context.Context, _ string, launch harnesses.Launch) (string, string, error) {
+	b.launches = append(b.launches, launch)
+	return "job-restored", "w-new:p1", nil
+}
+func (*restartBackend) Has(context.Context, string) bool                   { return false }
+func (*restartBackend) Teardown(context.Context, string, string) error     { return nil }
+func (*restartBackend) Cancel(context.Context, string, string) error       { return nil }
+func (*restartBackend) Send(context.Context, string, string) error         { return nil }
+func (*restartBackend) Pane(context.Context, string) (bool, *int, error)   { return false, nil, nil }
+func (*restartBackend) ServerAlive(context.Context) bool                   { return false }
+func (*restartBackend) Shutdown(context.Context) error                     { return nil }
+func (*restartBackend) Endpoint(string, string) *protocol.TerminalEndpoint { return nil }
+func (*restartBackend) Policy() backend.Policy                             { return backend.Policy{Name: "herdr"} }
+
+func TestRestartRestoreRehydratesPiArtifactPathsBeforeHerdrStart(t *testing.T) {
+	root, cwd := t.TempDir(), t.TempDir()
+	jobDir := filepath.Join(root, "artifact-restored")
+	if err := os.MkdirAll(jobDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Resume must not inherit an accidentally permissive historical mode.
+	if err := os.WriteFile(filepath.Join(jobDir, "task.json"), []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registryPath := filepath.Join(t.TempDir(), "workers.json")
+	registry, err := OpenRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := protocol.Job{ID: "restored", Harness: protocol.HarnessPi, CWD: cwd, Prompt: "continue", Artifacts: protocol.ArtifactMetadata{ID: "artifact-restored", Directory: jobDir}}
+	oldLaunch := harnesses.Launch{Session: "pi-session.jsonl", Events: "events.jsonl", Transcript: "pi-transcript.log", Dir: "."}
+	if err = registry.Put(Worker{Job: job, Launch: oldLaunch, Session: "job-restored", Target: "w-old:p1", RestartUntil: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := OpenRegistry(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restored.Snapshot()[job.ID].Job.Artifacts.Directory; got != "" {
+		t.Fatalf("host-local directory unexpectedly survived registry JSON: %q", got)
+	}
+
+	runtime := &restartBackend{}
+	s := &Supervisor{Registry: restored, Backend: runtime, ArtifactRoot: root, AllowedCWDRoots: []string{cwd}, Adapters: map[string]harnesses.Adapter{"pi": piadapter.Adapter{Binary: "pi"}}}
+	s.Recover(context.Background())
+	if len(runtime.launches) != 1 {
+		t.Fatalf("resume starts = %d, want one", len(runtime.launches))
+	}
+	launch := runtime.launches[0]
+	wantSession := filepath.Join(jobDir, "pi-session.jsonl")
+	wantEvents := filepath.Join(jobDir, "events.jsonl")
+	wantTask := filepath.Join(jobDir, "task.json")
+	if launch.Session != wantSession || launch.Events != wantEvents || launch.Transcript != filepath.Join(jobDir, "pi-transcript.log") || launch.Dir != cwd {
+		t.Fatalf("resume retained cwd-relative paths: %#v", launch)
+	}
+	if launch.Env[piadapter.TaskContextEnv] != wantTask || launch.Env[piadapter.CodingDirEnv] != filepath.Join(jobDir, "pi") {
+		t.Fatalf("resume environment not rooted in artifact directory: %#v", launch.Env)
+	}
+	info, err := os.Stat(wantTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("task context mode = %o, want 0600", info.Mode().Perm())
+	}
+	persisted := restored.Snapshot()[job.ID]
+	if persisted.Job.Artifacts.Directory != jobDir || persisted.Target != "w-new:p1" {
+		t.Fatalf("rehydrated worker was not persisted: %#v", persisted)
+	}
+}
+
+func TestCancelledObservationDoesNotSettleVanishedResumableWorker(t *testing.T) {
+	registry, err := OpenRegistry(filepath.Join(t.TempDir(), "workers.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := protocol.Job{ID: "shutdown", Harness: protocol.HarnessPi, Artifacts: protocol.ArtifactMetadata{ID: "artifact-shutdown"}}
+	if err = registry.Put(Worker{Job: job, Launch: harnesses.Launch{Events: filepath.Join(t.TempDir(), "events.jsonl")}, Session: "job-shutdown", Target: "w:p"}); err != nil {
+		t.Fatal(err)
+	}
+	s := &Supervisor{Registry: registry, Backend: &restartBackend{}, Adapters: map[string]harnesses.Adapter{"pi": piadapter.Adapter{}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // model golemd shutdown racing the owned Herdr child's disappearance
+	if err = s.observe(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown observation = %v, want context cancellation", err)
+	}
+	if got := registry.Snapshot()[job.ID]; !got.SettledAt.IsZero() || got.LastState.Terminal() {
+		t.Fatalf("shutdown disappearance settled resumable worker: %#v", got)
+	}
 }
 
 func TestScreenDetectedClaudeBlockBecomesDispatcherQuestion(t *testing.T) {

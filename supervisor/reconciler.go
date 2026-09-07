@@ -121,6 +121,16 @@ func (s *Supervisor) resumeWorker(ctx context.Context, w Worker, mode string) {
 	if err != nil {
 		return
 	}
+	// ArtifactMetadata.Directory is deliberately excluded from JSON because it
+	// is host-local. Consequently it is empty after workers.json is restored;
+	// rehydrate it from the configured root and immutable logical ID before the
+	// adapter rebuilds task.json and its private profile. Without this step Pi
+	// interprets "task.json" relative to golemd's cwd.
+	w.Job, err = s.localJob(w.Job)
+	if err != nil {
+		s.log().Warn("worker cannot resume", "job", w.Job.ID, "mode", mode, "error", err)
+		return
+	}
 	launch, err := a.Resume(ctx, w.Job, w.Launch)
 	if err != nil {
 		s.log().Warn("worker cannot resume", "job", w.Job.ID, "mode", mode, "error", err)
@@ -302,23 +312,10 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 	if err != nil {
 		return permanentStart("%v", err)
 	}
-	cwd, err := filepath.EvalSymlinks(j.CWD)
+	j, err = s.localJob(j)
 	if err != nil {
-		return permanentStart("invalid cwd %q: %v", j.CWD, err)
+		return permanentStart("%v", err)
 	}
-	cwd, err = filepath.Abs(cwd)
-	if err != nil || !withinAny(cwd, s.AllowedCWDRoots) {
-		return permanentStart("cwd %q is outside configured allowed roots", j.CWD)
-	}
-	j.CWD = cwd
-	if j.Artifacts.ID == "" || filepath.Base(j.Artifacts.ID) != j.Artifacts.ID || j.Artifacts.ID == "." || j.Artifacts.ID == ".." {
-		return permanentStart("invalid logical artifact id %q", j.Artifacts.ID)
-	}
-	root, err := filepath.Abs(s.ArtifactRoot)
-	if err != nil || s.ArtifactRoot == "" {
-		return permanentStart("invalid supervisor artifact root")
-	}
-	j.Artifacts.Directory = filepath.Join(root, j.Artifacts.ID)
 	if err = os.MkdirAll(j.Artifacts.Directory, 0o700); err != nil {
 		return err
 	}
@@ -344,6 +341,34 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 		s.log().Warn("starting observation deferred", "job", j.ID, "error", err)
 	}
 	return nil
+}
+
+// localJob restores and validates the host-local paths that are intentionally
+// absent from service and registry JSON. It is shared by first launch and
+// restart resume so both execute from the same canonical workspace/artifact
+// context regardless of golemd's process cwd.
+func (s *Supervisor) localJob(j protocol.Job) (protocol.Job, error) {
+	cwd, err := filepath.EvalSymlinks(j.CWD)
+	if err != nil {
+		return j, fmt.Errorf("invalid cwd %q: %v", j.CWD, err)
+	}
+	cwd, err = filepath.Abs(cwd)
+	if err != nil || !withinAny(cwd, s.AllowedCWDRoots) {
+		return j, fmt.Errorf("cwd %q is outside configured allowed roots", j.CWD)
+	}
+	if j.Artifacts.ID == "" || filepath.Base(j.Artifacts.ID) != j.Artifacts.ID || j.Artifacts.ID == "." || j.Artifacts.ID == ".." {
+		return j, fmt.Errorf("invalid logical artifact id %q", j.Artifacts.ID)
+	}
+	if s.ArtifactRoot == "" {
+		return j, errors.New("invalid supervisor artifact root")
+	}
+	root, err := filepath.Abs(s.ArtifactRoot)
+	if err != nil {
+		return j, errors.New("invalid supervisor artifact root")
+	}
+	j.CWD = cwd
+	j.Artifacts.Directory = filepath.Join(root, j.Artifacts.ID)
+	return j, nil
 }
 
 // observedAt is the honest timestamp for a state observation. tmux state is
@@ -524,6 +549,13 @@ func (s *Supervisor) observe(ctx context.Context) error {
 		}
 		runtime := s.runtime(w)
 		obs, observeErr := a.Observe(ctx, w.Job, &runtime)
+		// Shutdown cancellation is not evidence about the worker. In particular,
+		// the owned Herdr child may disappear while Pane is being observed and
+		// honestly return absent rather than a context error. Preserve resumable
+		// registry state for the next daemon instead of publishing failure.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if observeErr == nil {
 			progresses := obs.Progresses
 			if len(progresses) == 0 && obs.Progress != nil {
