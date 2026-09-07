@@ -19,10 +19,40 @@ type Harness struct {
 	Models []string `toml:"models"`
 }
 
+// Tiamat enables bounded Router catalogue discovery for Pi. Empty provider and
+// model restrictions accept every compatible, non-unavailable record. Models
+// are exact advertised IDs (tiamat-{family}-{encoded-provider}/{model}).
+type Tiamat struct {
+	Providers        []string `toml:"providers"`
+	Models           []string `toml:"models"`
+	CacheTTL         string   `toml:"cache_ttl"`
+	StaleTTL         string   `toml:"stale_ttl"`
+	Timeout          string   `toml:"timeout"`
+	MaxModels        int      `toml:"max_models"`
+	MaxResponseBytes int64    `toml:"max_response_bytes"`
+}
+
+func (t Tiamat) Durations() (cache, stale, timeout time.Duration, err error) {
+	parse := func(value string) (time.Duration, error) {
+		if value == "" {
+			return 0, nil
+		}
+		return time.ParseDuration(value)
+	}
+	if cache, err = parse(t.CacheTTL); err != nil {
+		return
+	}
+	if stale, err = parse(t.StaleTTL); err != nil {
+		return
+	}
+	timeout, err = parse(t.Timeout)
+	return
+}
+
 type Provider struct {
-	// Kind is empty for a statically configured OpenAI-compatible provider.
-	// "tiamat" delegates provider/model registration to Golem's isolated pi
-	// extension and therefore requires no base URL or provider credential here.
+	// Kind is reserved for migration diagnostics. Static providers leave it
+	// empty; Tiamat providers are discovered through the top-level [tiamat]
+	// section rather than duplicated here.
 	Kind      string `toml:"kind"`
 	BaseURL   string `toml:"base_url"`
 	APIKeyEnv string `toml:"api_key_env"`
@@ -93,6 +123,7 @@ type Config struct {
 	APIBearerTokens []string            `toml:"api_bearer_tokens"`
 	AttachSSH       AttachSSH           `toml:"attach_ssh"`
 	Herdr           *Herdr              `toml:"herdr"`
+	Tiamat          *Tiamat             `toml:"tiamat"`
 }
 
 func Load(path string) (Config, error) {
@@ -137,9 +168,7 @@ func Load(path string) (Config, error) {
 				return Config{}, fmt.Errorf("provider %q requires base_url", name)
 			}
 		case "tiamat":
-			if p.BaseURL != "" || p.APIKeyEnv != "" {
-				return Config{}, fmt.Errorf("tiamat provider %q must not set base_url or api_key_env", name)
-			}
+			return Config{}, fmt.Errorf("provider %q: kind = \"tiamat\" was replaced by dynamic [tiamat] discovery", name)
 		default:
 			return Config{}, fmt.Errorf("provider %q has unsupported kind %q", name, p.Kind)
 		}
@@ -155,6 +184,44 @@ func Load(path string) (Config, error) {
 			}
 			if _, found = c.Providers[provider]; !found {
 				return Config{}, fmt.Errorf("pi model %q references missing provider %q", model, provider)
+			}
+		}
+	}
+	if c.Tiamat != nil {
+		if _, ok := c.Harnesses["pi"]; !ok {
+			return Config{}, errors.New("[tiamat] requires the pi harness")
+		}
+		cache, stale, timeout, durationErr := c.Tiamat.Durations()
+		if durationErr != nil {
+			return Config{}, fmt.Errorf("tiamat duration: %w", durationErr)
+		}
+		if cache < 0 || stale < 0 || timeout < 0 {
+			return Config{}, errors.New("tiamat durations must not be negative")
+		}
+		if cache > 0 && stale > 0 && stale < cache {
+			return Config{}, errors.New("tiamat stale_ttl must be at least cache_ttl")
+		}
+		if cache > time.Hour || stale > 24*time.Hour || timeout > 30*time.Second {
+			return Config{}, errors.New("tiamat cache_ttl must not exceed 1h, stale_ttl 24h, or timeout 30s")
+		}
+		if c.Tiamat.MaxModels < 0 || c.Tiamat.MaxModels > 5000 {
+			return Config{}, errors.New("tiamat max_models must be between 1 and 5000 when set")
+		}
+		if c.Tiamat.MaxResponseBytes < 0 || c.Tiamat.MaxResponseBytes > 16<<20 {
+			return Config{}, errors.New("tiamat max_response_bytes must not exceed 16777216")
+		}
+		for name := range c.Providers {
+			if dynamicTiamatProviderName(name) {
+				return Config{}, fmt.Errorf("provider %q uses a namespace reserved by dynamic [tiamat] discovery", name)
+			}
+		}
+		for field, values := range map[string][]string{"providers": c.Tiamat.Providers, "models": c.Tiamat.Models} {
+			seen := map[string]bool{}
+			for _, value := range values {
+				if value == "" || seen[value] {
+					return Config{}, fmt.Errorf("tiamat %s must not contain empty or duplicate values", field)
+				}
+				seen[value] = true
 			}
 		}
 	}
@@ -250,6 +317,15 @@ func validHerdrSession(s string) bool {
 		}
 	}
 	return s != "" && s != "default" && s != "." && s != ".."
+}
+
+func dynamicTiamatProviderName(value string) bool {
+	for _, family := range []string{"anthropic", "openai", "responses"} {
+		if strings.HasPrefix(value, "tiamat-"+family+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 func validEnvName(s string) bool {

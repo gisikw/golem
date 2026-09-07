@@ -91,6 +91,13 @@ type ProjectCapability struct {
 	Description string `json:"description,omitempty"`
 }
 
+type DiscoveryStatus struct {
+	Status      string    `json:"status"` // fresh, stale, or unavailable
+	RefreshedAt time.Time `json:"refreshed_at"`
+	// Error is deliberately bounded to a credential-free resolver summary.
+	Error string `json:"error,omitempty"`
+}
+
 type Capabilities struct {
 	Name         string                       `json:"name"`
 	Version      string                       `json:"version"`
@@ -98,6 +105,7 @@ type Capabilities struct {
 	Projects     []ProjectCapability          `json:"projects"`
 	CloneEnabled bool                         `json:"clone_enabled"`
 	AttachPort   int                          `json:"attach_port"`
+	Discovery    map[string]DiscoveryStatus   `json:"discovery,omitempty"`
 }
 
 const (
@@ -154,39 +162,60 @@ type ResolvedWorkspace struct {
 	Path     string `json:"path"`
 }
 
+// TiamatProvisioning is the credential-free catalogue row authorized when a
+// dynamic job is accepted. It is persisted with the job so worker start and
+// recovery never re-authorize against a different live catalogue.
+type TiamatProvisioning struct {
+	Model                 string             `json:"model"`
+	API                   string             `json:"api"`
+	Provider              string             `json:"provider"`
+	Fidelity              string             `json:"fidelity"`
+	Availability          string             `json:"availability"`
+	ContextWindow         *int64             `json:"context_window,omitempty"`
+	MaxOutputTokens       *int64             `json:"max_output_tokens,omitempty"`
+	Reasoning             *bool              `json:"reasoning,omitempty"`
+	Input                 []string           `json:"input,omitempty"`
+	ThinkingLevelMap      map[string]*string `json:"thinking_level_map,omitempty"`
+	ForceAdaptiveThinking *bool              `json:"force_adaptive_thinking,omitempty"`
+}
+
 type Job struct {
-	ID              string             `json:"id"`
-	IdempotencyKey  string             `json:"idempotency_key"`
-	Harness         HarnessKind        `json:"harness"`
-	Model           string             `json:"model,omitempty"`
-	CWD             string             `json:"cwd"`
-	Workspace       *ResolvedWorkspace `json:"workspace,omitempty"`
-	Prompt          string             `json:"prompt"`
-	Artifacts       ArtifactMetadata   `json:"artifacts"`
-	Host            string             `json:"host"`
-	State           State              `json:"state"`
-	CancelRequested bool               `json:"cancel_requested,omitempty"`
-	ReapRequested   bool               `json:"reap_requested,omitempty"`
-	Question        *BlockedQuestion   `json:"question,omitempty"`
-	Steers          []Steer            `json:"steers,omitempty"`
-	LastProgress    *Progress          `json:"last_progress,omitempty"`
-	Settlement      *Settlement        `json:"settlement,omitempty"`
-	Terminal        *TerminalEndpoint  `json:"terminal,omitempty"`
-	Activation      *Activation        `json:"activation,omitempty"`
-	CreatedAt       time.Time          `json:"created_at"`
-	UpdatedAt       time.Time          `json:"updated_at"`
+	ID             string      `json:"id"`
+	IdempotencyKey string      `json:"idempotency_key"`
+	Harness        HarnessKind `json:"harness"`
+	Model          string      `json:"model,omitempty"`
+	// Tiamat is internal provisioning metadata. HTTP handlers redact it from
+	// public job responses; it contains no token, token path, or other secret.
+	Tiamat          *TiamatProvisioning `json:"tiamat,omitempty"`
+	CWD             string              `json:"cwd"`
+	Workspace       *ResolvedWorkspace  `json:"workspace,omitempty"`
+	Prompt          string              `json:"prompt"`
+	Artifacts       ArtifactMetadata    `json:"artifacts"`
+	Host            string              `json:"host"`
+	State           State               `json:"state"`
+	CancelRequested bool                `json:"cancel_requested,omitempty"`
+	ReapRequested   bool                `json:"reap_requested,omitempty"`
+	Question        *BlockedQuestion    `json:"question,omitempty"`
+	Steers          []Steer             `json:"steers,omitempty"`
+	LastProgress    *Progress           `json:"last_progress,omitempty"`
+	Settlement      *Settlement         `json:"settlement,omitempty"`
+	Terminal        *TerminalEndpoint   `json:"terminal,omitempty"`
+	Activation      *Activation         `json:"activation,omitempty"`
+	CreatedAt       time.Time           `json:"created_at"`
+	UpdatedAt       time.Time           `json:"updated_at"`
 }
 
 type CreateJob struct {
-	IdempotencyKey    string             `json:"idempotency_key"`
-	Harness           HarnessKind        `json:"harness"`
-	Model             string             `json:"model,omitempty"`
-	CWD               string             `json:"cwd,omitempty"`
-	Workspace         *WorkspaceSelector `json:"workspace,omitempty"`
-	ResolvedWorkspace *ResolvedWorkspace `json:"-"`
-	Prompt            string             `json:"prompt"`
-	Artifacts         ArtifactRequest    `json:"artifacts,omitempty"`
-	Host              string             `json:"host,omitempty"`
+	IdempotencyKey    string              `json:"idempotency_key"`
+	Harness           HarnessKind         `json:"harness"`
+	Model             string              `json:"model,omitempty"`
+	CWD               string              `json:"cwd,omitempty"`
+	Workspace         *WorkspaceSelector  `json:"workspace,omitempty"`
+	ResolvedWorkspace *ResolvedWorkspace  `json:"-"`
+	Tiamat            *TiamatProvisioning `json:"-"`
+	Prompt            string              `json:"prompt"`
+	Artifacts         ArtifactRequest     `json:"artifacts,omitempty"`
+	Host              string              `json:"host,omitempty"`
 }
 
 type Assignment struct {

@@ -24,9 +24,9 @@ func TestLoadNestedHarnessModelsAndProjects(t *testing.T) {
 	}
 }
 
-func TestLoadTiamatProviderWithoutStaticEndpoint(t *testing.T) {
+func TestLoadDynamicTiamatWithoutExhaustiveInventory(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "golemd.toml")
-	data := "name = \"test\"\n[providers.tiamat-responses-codex-personal]\nkind = \"tiamat\"\n[harnesses.pi]\nmodels = [\"tiamat-responses-codex-personal/gpt-5.6-sol\"]\n"
+	data := "name = \"test\"\n[harnesses.pi]\nmodels = []\n[tiamat]\nproviders = [\"astra/personal\"]\ncache_ttl = \"30s\"\nstale_ttl = \"10m\"\ntimeout = \"5s\"\nmax_models = 500\n"
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -34,8 +34,30 @@ func TestLoadTiamatProviderWithoutStaticEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Providers["tiamat-responses-codex-personal"].Kind != "tiamat" {
-		t.Fatalf("tiamat provider lost: %#v", cfg.Providers)
+	if cfg.Tiamat == nil || cfg.Tiamat.Providers[0] != "astra/personal" || len(cfg.Harnesses["pi"].Models) != 0 {
+		t.Fatalf("dynamic config lost: %#v", cfg)
+	}
+}
+
+func TestLoadRejectsReplacedStaticTiamatInventory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "golemd.toml")
+	data := "name = \"test\"\n[providers.tiamat-responses-codex-personal]\nkind = \"tiamat\"\n[harnesses.pi]\nmodels = [\"tiamat-responses-codex-personal/gpt-5.6-sol\"]\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "dynamic [tiamat] discovery") {
+		t.Fatalf("old duplicated inventory accepted or unclear migration: %v", err)
+	}
+}
+
+func TestLoadRejectsDynamicTiamatNamespaceCollision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "golemd.toml")
+	data := "name = \"test\"\n[providers.tiamat-responses-attacker]\nbase_url = \"https://wrong.example/v1\"\n[harnesses.pi]\nmodels = [\"tiamat-responses-attacker/model\"]\n[tiamat]\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "namespace reserved") {
+		t.Fatalf("dynamic provider collision accepted or unclear error: %v", err)
 	}
 }
 

@@ -68,7 +68,11 @@ type Adapter struct {
 	DefaultProvider string
 	DefaultModel    string
 	Providers       map[string]Provider
-	Env             map[string]string
+	// Tiamat permits resolver-authorized dynamic tiamat-{family}-{provider}
+	// IDs. The worker provisions from the job's exact accepted catalogue row,
+	// without copying its Router token into protocol data or artifacts.
+	Tiamat bool
+	Env    map[string]string
 }
 
 // Provider is operator-owned connection configuration. APIKeyEnv names a
@@ -89,6 +93,10 @@ const TaskContextEnv = "GOLEM_TASK_CONTEXT"
 // CodingDirEnv is the pi coding-agent dir. The adapter sets it explicitly per
 // worker so the ambient (operator) value can never take effect.
 const CodingDirEnv = "PI_CODING_AGENT_DIR"
+
+// TiamatSnapshotEnv points at the credential-free catalogue row authorized
+// for this job. It is not a live-discovery endpoint or credential.
+const TiamatSnapshotEnv = "GOLEM_TIAMAT_SNAPSHOT_FILE"
 
 // blockSuffix is appended to the worker's initial prompt. Blocking is an
 // explicit agent action (pi has no native ask mechanism): the agent-hooks
@@ -125,6 +133,9 @@ func (a Adapter) launchEnv(events, workerDir, taskContext string) map[string]str
 	// supervisor process inherited from the operator, so the worker never loads
 	// the operator's personal profile.
 	env[CodingDirEnv] = workerDir
+	if _, err := os.Stat(filepath.Join(workerDir, "tiamat-snapshot.json")); err == nil {
+		env[TiamatSnapshotEnv] = filepath.Join(workerDir, "tiamat-snapshot.json")
+	}
 	return env
 }
 
@@ -189,7 +200,7 @@ func (a Adapter) workerExtensions() []string {
 // with exactly that model and nothing else: a single-provider models.json,
 // pinned defaults, and one enabledModels entry. Any API key is read from the
 // daemon environment at this point and never enters protocol or store data.
-func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
+func (a Adapter) writeWorkerProfile(dir, dispatchedModel string, tiamat *protocol.TiamatProvisioning) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -214,7 +225,11 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 		if !ok || provider == "" || model == "" {
 			return fmt.Errorf("pi model %q must be provider/model", dispatchedModel)
 		}
-		if configuredProvider, ok = a.Providers[provider]; !ok {
+		configuredProvider, ok = a.Providers[provider]
+		if !ok && a.Tiamat && dynamicTiamatProvider(provider) {
+			configuredProvider, ok = Provider{Kind: "tiamat"}, true
+		}
+		if !ok {
 			return fmt.Errorf("pi provider %q is not configured", provider)
 		}
 		configured = true
@@ -228,6 +243,16 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 		extensions = append(extensions, privateHerdr)
 	}
 	if configured && configuredProvider.Kind == "tiamat" {
+		if tiamat == nil || dynamicTiamatProviderID(tiamat.API, tiamat.Provider) != provider || tiamat.Model != model {
+			return fmt.Errorf("pi model %q lacks its authorized Tiamat snapshot", dispatchedModel)
+		}
+		snapshot, err := json.MarshalIndent([]*protocol.TiamatProvisioning{tiamat}, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err = os.WriteFile(filepath.Join(dir, "tiamat-snapshot.json"), snapshot, 0o600); err != nil {
+			return err
+		}
 		builtIn, err := piintegration.WriteTiamat(dir)
 		if err != nil {
 			return err
@@ -425,7 +450,7 @@ func (a Adapter) Start(_ context.Context, j protocol.Job) (harnesses.Launch, err
 	if err != nil {
 		return harnesses.Launch{}, err
 	}
-	if err := a.writeWorkerProfile(wd, j.Model); err != nil {
+	if err := a.writeWorkerProfile(wd, j.Model, j.Tiamat); err != nil {
 		return harnesses.Launch{}, err
 	}
 	// Interactive TUI: no --mode json --print. The positional prompt is
@@ -454,7 +479,7 @@ func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (
 	if err != nil {
 		return harnesses.Launch{}, err
 	}
-	if err := a.writeWorkerProfile(wd, j.Model); err != nil {
+	if err := a.writeWorkerProfile(wd, j.Model, j.Tiamat); err != nil {
 		return harnesses.Launch{}, err
 	}
 	l.Argv = []string{a.bin(), "--session", l.Session, "--no-context-files", "--no-skills"}
@@ -466,6 +491,38 @@ func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (
 	l.Env = a.launchEnv(l.Events, wd, taskContext)
 	l.Interactive = true
 	return l, nil
+}
+
+func dynamicTiamatProviderID(api, rawProvider string) string {
+	family := map[string]string{
+		"/anthropic/v1/messages":      "anthropic",
+		"/openai/v1/chat/completions": "openai",
+		"/responses/v1/responses":     "responses",
+	}[api]
+	if family == "" || rawProvider == "" {
+		return ""
+	}
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for _, c := range []byte(rawProvider) {
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-_.!~*'()", rune(c)) {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&15])
+		}
+	}
+	return "tiamat-" + family + "-" + b.String()
+}
+
+func dynamicTiamatProvider(provider string) bool {
+	for _, family := range []string{"anthropic", "openai", "responses"} {
+		if strings.HasPrefix(provider, "tiamat-"+family+"-") && len(provider) > len("tiamat-"+family+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneEnv(src map[string]string) map[string]string {

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
@@ -26,7 +27,8 @@ type API struct {
 	Logger       *slog.Logger
 	Capabilities protocol.Capabilities
 	Workspaces   *WorkspaceResolver
-	PiProviders  map[string]bool
+	PiProviders  map[string]bool // legacy/static fallback when Resolver is nil
+	Resolver     CapabilityResolver
 	ArtifactRoot string
 	// Backend describes the active run substrate. Its zero value is tmux: every
 	// configured harness dispatches, attach and steer work as they always have.
@@ -53,8 +55,16 @@ func (a API) Handler() http.Handler {
 		}
 		output(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
-	m.HandleFunc("GET /v1/capabilities", func(w http.ResponseWriter, _ *http.Request) {
-		output(w, http.StatusOK, a.Capabilities)
+	m.HandleFunc("GET /v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		snapshot, err := a.resolveCapabilities(r.Context())
+		if err != nil {
+			failure(w, err, http.StatusServiceUnavailable)
+			return
+		}
+		if snapshot.Stale {
+			w.Header().Set("Warning", `110 - "Tiamat catalogue is stale"`)
+		}
+		output(w, http.StatusOK, snapshot.Capabilities)
 	})
 	m.HandleFunc("POST /v1/jobs", a.create)
 	m.HandleFunc("GET /v1/jobs", a.list)
@@ -94,13 +104,44 @@ func output(w http.ResponseWriter, status int, v any) {
 func failure(w http.ResponseWriter, err error, status int) {
 	output(w, status, map[string]string{"error": err.Error()})
 }
+func (a API) resolveCapabilities(ctx context.Context) (CapabilitySnapshot, error) {
+	if a.Resolver != nil {
+		return a.Resolver.Resolve(ctx)
+	}
+	return CapabilitySnapshot{Capabilities: a.Capabilities, PiProviders: a.PiProviders}, nil
+}
+
+func (a API) requiresDynamicResolution(x protocol.CreateJob) bool {
+	if a.Resolver == nil || x.Harness != protocol.HarnessPi || x.Model == "" {
+		return false
+	}
+	for _, model := range a.Capabilities.Harnesses[string(protocol.HarnessPi)].Models {
+		if model == x.Model {
+			return false
+		}
+	}
+	return true
+}
+
 func (a API) create(w http.ResponseWriter, r *http.Request) {
 	var x protocol.CreateJob
 	if err := decode(w, r, &x); err != nil {
 		failure(w, err, 400)
 		return
 	}
-	harness, ok := a.Capabilities.Harnesses[string(x.Harness)]
+	snapshot := CapabilitySnapshot{Capabilities: a.Capabilities, PiProviders: a.PiProviders}
+	var err error
+	if a.requiresDynamicResolution(x) {
+		snapshot, err = a.resolveCapabilities(r.Context())
+		if err != nil {
+			failure(w, err, http.StatusServiceUnavailable)
+			return
+		}
+	}
+	if snapshot.Stale {
+		w.Header().Set("Warning", `110 - "Tiamat catalogue is stale"`)
+	}
+	harness, ok := snapshot.Capabilities.Harnesses[string(x.Harness)]
 	if !ok {
 		failure(w, fmt.Errorf("harness %q is not configured", x.Harness), http.StatusUnprocessableEntity)
 		return
@@ -124,9 +165,14 @@ func (a API) create(w http.ResponseWriter, r *http.Request) {
 	}
 	if x.Harness == protocol.HarnessPi && x.Model != "" {
 		provider, _, ok := strings.Cut(x.Model, "/")
-		if !ok || !a.PiProviders[provider] {
+		if !ok || !snapshot.PiProviders[provider] {
 			failure(w, fmt.Errorf("pi model %q has no configured provider", x.Model), http.StatusUnprocessableEntity)
 			return
+		}
+		if provision, dynamic := snapshot.TiamatModels[x.Model]; dynamic {
+			// Pin the exact authorized row into durable job state. Worker startup
+			// and resume consume this snapshot and never perform live discovery.
+			x.Tiamat = &provision
 		}
 	}
 	if x.Workspace != nil {
@@ -207,6 +253,9 @@ func (a API) attach(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a API) publicJob(j *protocol.Job) {
+	// Internal, credential-free provisioning metadata is needed only by the
+	// local poll/supervisor path; public job APIs expose the selected model ID.
+	j.Tiamat = nil
 	if a.Capabilities.AttachPort == 0 || j.State.Terminal() || j.Activation != nil && j.Activation.Port != a.Capabilities.AttachPort {
 		j.Activation = nil
 	}

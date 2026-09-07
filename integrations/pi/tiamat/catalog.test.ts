@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   catalogToProviderGroups,
+  isCatalog,
   isInferenceApi,
   etagRequiresFetch,
   withoutMaxOutputTokens,
@@ -27,8 +28,9 @@ describe("Tiamat catalog mapping", () => {
       "tiamat-responses-codex%2Fpersonal",
     ]);
     expect(groups[0].models[0].id).toBe("claude-sonnet");
-    expect(groups[0].models[0].baseUrl).toBe("https://router.example/anthropic/personal");
-    expect(groups[2].baseUrl).toBe("https://router.example/responses/codex%2Fpersonal/v1");
+    expect(groups[0].models[0].baseUrl).toBe("https://router.example/anthropic");
+    expect(groups[2].baseUrl).toBe("https://router.example/responses/v1");
+    expect(groups[2].tiamatProvider).toBe("codex/personal");
     expect(groups[2].models[0]).toMatchObject({
       reasoning: true,
       input: ["text", "image"],
@@ -48,9 +50,9 @@ describe("Tiamat catalog mapping", () => {
       .map((group) => [group.family, group.baseUrl]));
 
     // Anthropic appends /v1/messages; OpenAI appends /chat/completions or /responses.
-    expect(byFamily.get("anthropic")).toBe("https://router.example/anthropic/account");
-    expect(byFamily.get("openai")).toBe("https://router.example/openai/account/v1");
-    expect(byFamily.get("responses")).toBe("https://router.example/responses/account/v1");
+    expect(byFamily.get("anthropic")).toBe("https://router.example/anthropic");
+    expect(byFamily.get("openai")).toBe("https://router.example/openai/v1");
+    expect(byFamily.get("responses")).toBe("https://router.example/responses/v1");
   });
 
   test("filters unavailable and labels degraded records", () => {
@@ -58,6 +60,11 @@ describe("Tiamat catalog mapping", () => {
     expect(groups.flatMap((group) => group.models).some((model) => model.id === "gone")).toBe(false);
     expect(groups.find((group) => group.id === "tiamat-anthropic-work")?.models[0].name)
       .toBe("claude-sonnet via work (degraded)");
+  });
+
+  test("deduplicates repeated provider/model rows", () => {
+    const duplicate = [records[0], { ...records[0], availability: "degraded" as const }];
+    expect(catalogToProviderGroups(duplicate, "https://router.example")[0].models).toHaveLength(1);
   });
 
   test("uses optional catalog token limits while retaining defaults", () => {
@@ -92,6 +99,15 @@ describe("ETag polling", () => {
     expect(etagRequiresFetch(200, '"old"', null)).toBe(true);
     expect(etagRequiresFetch(500, '"old"', '"new"')).toBe(false);
   });
+});
+
+test("catalog validation rejects provider header injection and malformed thinking maps", () => {
+  const base = { model: "m", api: "/responses/v1/responses", provider: "safe", fidelity: "native", availability: "available" };
+  expect(isCatalog([{ ...base, provider: "bad\r\nx-evil: yes" }])).toBe(false);
+  expect(isCatalog([{ ...base, provider: "bad provider" }])).toBe(false);
+  expect(isCatalog([{ ...base, thinking_level_map: [] }])).toBe(false);
+  expect(isCatalog([{ ...base, thinking_level_map: { surprise: "high" } }])).toBe(false);
+  expect(isCatalog([{ ...base, thinking_level_map: { off: null, high: "high" } }])).toBe(true);
 });
 
 test("isInferenceApi admits the three inference wires and nothing else", () => {
