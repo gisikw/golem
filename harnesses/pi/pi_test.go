@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gisikw/golem/harnesses"
 	"github.com/gisikw/golem/protocol"
@@ -440,6 +441,9 @@ func TestObserveProjectsSideChannelWithCursor(t *testing.T) {
 	o, err = (Adapter{}).Observe(context.Background(), j, r)
 	if err != nil || !o.Settled || o.Verdict != protocol.Done || o.Summary != "all done" {
 		t.Fatalf("settlement not projected: %#v, %v", o, err)
+	}
+	if !o.TerminalAt.Equal(time.UnixMilli(3).UTC()) || o.TerminalCursor != int64(len(initial))+int64(len("{\"type\":\"settled\",\"ts\":3,\"verdict\":\"done\",\"summary\":\"all done\",\"usage\":{\"input\":10,\"output\":4,\"cost\":0.002}}\n")) {
+		t.Fatalf("terminal generation metadata not projected: %#v", o)
 	}
 	if o.Usage == nil || o.Usage.InputTokens != 10 || o.Usage.OutputTokens != 4 || o.Usage.CostMicros != 2000 {
 		t.Fatalf("settlement usage not projected: %#v", o.Usage)

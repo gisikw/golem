@@ -50,6 +50,12 @@ type Observation struct {
 	Cursor     int64
 	Question   *protocol.BlockedQuestion
 	Detail     []byte
+	// TerminalAt and TerminalCursor identify the side-channel record that set
+	// Settled. TerminalCursor is the byte offset immediately after that record.
+	// Together they let the supervisor reject a record from an older process
+	// generation even when it was unread when a replacement target started.
+	TerminalAt     time.Time
+	TerminalCursor int64
 	// Settled reports a side-channel settlement while the harness process is
 	// still alive (an interactive TUI does not exit when a turn completes).
 	// Verdict/Summary/Usage carry the harness-reported settlement content.

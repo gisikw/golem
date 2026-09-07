@@ -211,6 +211,10 @@ func (a Adapter) Observe(ctx context.Context, j protocol.Job, r *harnesses.Runti
 			o.Settled = true
 			o.Verdict = mapVerdict(e.Verdict)
 			o.Summary = e.Summary
+			o.TerminalCursor = o.Cursor
+			if e.Ts != 0 {
+				o.TerminalAt = at
+			}
 			if o.Summary == "" {
 				o.Summary = "claude turn completed"
 			}

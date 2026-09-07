@@ -23,8 +23,13 @@ type Worker struct {
 	AnsweredKey       string           `json:"answered_key,omitempty"`
 	SteeredKey        string           `json:"steered_key,omitempty"`
 	ObservationCursor int64            `json:"observation_cursor,omitempty"`
-	StartedAt         time.Time        `json:"started_at"`
-	SettledAt         time.Time        `json:"settled_at,omitempty"`
+	// GenerationStartedAt and GenerationCursor are the launch boundary for the
+	// current target. They prevent unread side-channel records from a previous
+	// target generation from settling a successfully resumed target.
+	GenerationStartedAt time.Time `json:"generation_started_at,omitempty"`
+	GenerationCursor    int64     `json:"generation_cursor,omitempty"`
+	StartedAt           time.Time `json:"started_at"`
+	SettledAt           time.Time `json:"settled_at,omitempty"`
 }
 
 type StartAttempt struct {

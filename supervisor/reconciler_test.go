@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -277,6 +278,261 @@ func TestHerdrBackendShutdownBeforeSignalDoesNotSettleAndRestartResumes(t *testi
 	resumed := restored.Snapshot()[job.ID]
 	if !resumed.SettledAt.IsZero() || resumed.Target != "w-new:p1" {
 		t.Fatalf("replacement did not preserve resumed worker: %#v", resumed)
+	}
+}
+
+func TestResumedPiEvidenceSupersedesStaleShutdownSettlement(t *testing.T) {
+	ctx := context.Background()
+	cwd, artifactRoot := t.TempDir(), t.TempDir()
+	s, store, _ := testSupervisor(t, cwd, artifactRoot)
+	backend := &shutdownRaceBackend{} // absent until Tick resumes the worker
+	s.Backend = backend
+	s.Adapters["pi"] = piadapter.Adapter{Binary: "pi"}
+
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "resume-stale-terminal", Harness: "pi", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("resume-stale-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job.Artifacts.Directory = filepath.Join(artifactRoot, job.Artifacts.ID)
+	if err = os.MkdirAll(job.Artifacts.Directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	events := filepath.Join(job.Artifacts.Directory, "events.jsonl")
+	beforeStale := "" +
+		`{"type":"running","ts":1788812718122,"message":"worker running"}` + "\n" +
+		`{"type":"progress","ts":1788812720000,"message":"old progress"}` + "\n"
+	staleFailure := `{"type":"settled","ts":1788812767940,"verdict":"failed","summary":"worker settled without a non-empty final response"}` + "\n"
+	if err = os.WriteFile(events, []byte(beforeStale+staleFailure), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worker := Worker{
+		Job: job,
+		Launch: harnesses.Launch{
+			Session: filepath.Join(job.Artifacts.Directory, "pi-session.jsonl"),
+			Events:  events,
+			Dir:     cwd,
+		},
+		Session:           "job-old",
+		Target:            "w-old:p1",
+		LastState:         protocol.Running,
+		ObservationCursor: int64(len(beforeStale)), // old daemon had not persisted line 3
+		RestartUntil:      time.Now().Add(time.Hour),
+		StartedAt:         time.Now().Add(-time.Minute),
+	}
+	if err = s.Registry.Put(worker); err != nil {
+		t.Fatal(err)
+	}
+
+	// One Tick must both resume and then observe the old shutdown record. It is
+	// held for confirmation rather than published.
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.launches) != 1 || !backend.alive {
+		t.Fatalf("worker was not resumed exactly once: launches=%d alive=%t", len(backend.launches), backend.alive)
+	}
+	got, err := store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.Running || got.Settlement != nil {
+		t.Fatalf("stale shutdown settlement published on resume Tick: %#v", got)
+	}
+	resumedWorker := s.Registry.Snapshot()[job.ID]
+	if cursor := resumedWorker.ObservationCursor; cursor != int64(len(beforeStale+staleFailure)) {
+		t.Fatalf("cursor after stale observation = %d, want %d", cursor, len(beforeStale+staleFailure))
+	}
+	if resumedWorker.GenerationCursor != int64(len(beforeStale+staleFailure)) || resumedWorker.GenerationStartedAt.IsZero() || resumedWorker.StartedAt.Before(resumedWorker.GenerationStartedAt) {
+		t.Fatalf("resume generation boundary not persisted: %#v", resumedWorker)
+	}
+
+	// Startup may legitimately take several reconciliation intervals before Pi
+	// appends current-generation bytes. The old failure must never become true
+	// merely through repeated observation, and a live replacement must not be
+	// resumed again.
+	for i := 0; i < 3; i++ {
+		if err = s.Tick(ctx); err != nil {
+			t.Fatal(err)
+		}
+		got, err = store.Get(ctx, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != protocol.Running || got.Settlement != nil {
+			t.Fatalf("stale failure settled on quiet tick %d: %#v", i+1, got)
+		}
+		if len(backend.launches) != 1 {
+			t.Fatalf("quiet startup caused duplicate resume on tick %d: launches=%d", i+1, len(backend.launches))
+		}
+	}
+
+	// The resumed target then emits fresh running evidence and its genuine done
+	// settlement. The very next Tick must publish done, never replay the older
+	// failed observation. Event timestamps are current-generation wall time;
+	// cursor ordering remains the primary boundary for bytes present at launch.
+	freshTs := time.Now().Add(time.Millisecond).UnixMilli()
+	resumed := fmt.Sprintf(""+
+		`{"type":"running","ts":%d,"message":"resumed worker running"}`+"\n"+
+		`{"type":"progress","ts":%d,"message":"resumed progress 1"}`+"\n"+
+		`{"type":"progress","ts":%d,"message":"resumed progress 2"}`+"\n"+
+		`{"type":"progress","ts":%d,"message":"resumed progress 3"}`+"\n"+
+		`{"type":"settled","ts":%d,"verdict":"done","summary":"GOLEMD-RESUME-SMOKE-OK"}`+"\n",
+		freshTs, freshTs+1, freshTs+2, freshTs+3, freshTs+4)
+	f, err := os.OpenFile(events, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.WriteString(resumed); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.Done || got.Settlement == nil || got.Settlement.Summary != "GOLEMD-RESUME-SMOKE-OK" {
+		t.Fatalf("fresh resumed settlement did not supersede stale failure: %#v", got)
+	}
+	if len(backend.launches) != 1 {
+		t.Fatalf("pending confirmation caused duplicate resume: launches=%d", len(backend.launches))
+	}
+}
+
+func TestPendingPiDoneSettlesBeforeResumeWithoutDuplicateTarget(t *testing.T) {
+	ctx := context.Background()
+	cwd, artifactRoot := t.TempDir(), t.TempDir()
+	s, store, _ := testSupervisor(t, cwd, artifactRoot)
+	b := &shutdownRaceBackend{}
+	s.Backend = b
+	s.Adapters["pi"] = piadapter.Adapter{Binary: "pi"}
+
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "pending-done-before-resume", Harness: "pi", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("pending-done-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job.Artifacts.Directory = filepath.Join(artifactRoot, job.Artifacts.ID)
+	if err = os.MkdirAll(job.Artifacts.Directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	events := filepath.Join(job.Artifacts.Directory, "events.jsonl")
+	done := `{"type":"settled","ts":1788812718122,"verdict":"done","summary":"completed before restart"}` + "\n"
+	if err = os.WriteFile(events, []byte(done), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Registry.Put(Worker{
+		Job: job, Launch: harnesses.Launch{Session: filepath.Join(job.Artifacts.Directory, "pi-session.jsonl"), Events: events, Dir: cwd},
+		Session: "job-old", Target: "w-old:p1", LastState: protocol.Running,
+		RestartUntil: time.Now().Add(time.Hour), StartedAt: time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.launches) != 0 || b.alive {
+		t.Fatalf("completed turn launched a duplicate target: launches=%d alive=%t", len(b.launches), b.alive)
+	}
+	got, err := store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.Done || got.Settlement == nil || got.Settlement.Summary != "completed before restart" {
+		t.Fatalf("pending genuine completion was not published: %#v", got)
+	}
+	worker := s.Registry.Snapshot()[job.ID]
+	if worker.SettledAt.IsZero() || worker.ObservationCursor != int64(len(done)) {
+		t.Fatalf("pending completion/cursor not durable: %#v", worker)
+	}
+}
+
+func TestCurrentGenerationSettlementPublicationRetriesAfterCursorAdvance(t *testing.T) {
+	ctx := context.Background()
+	cwd, artifactRoot := t.TempDir(), t.TempDir()
+	store, err := service.Open(filepath.Join(t.TempDir(), "service.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	api := service.API{Store: store, Capabilities: protocol.Capabilities{Name: "host", Harnesses: map[string]protocol.HarnessCapability{"pi": {}}}}.Handler()
+	failed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/events" && !failed {
+			failed = true
+			http.Error(w, "injected publication failure", http.StatusServiceUnavailable)
+			return
+		}
+		api.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	registry, err := OpenRegistry(filepath.Join(t.TempDir(), "workers.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Supervisor{
+		Host: "host", Client: client.New(server.URL), Registry: registry, Backend: &shutdownRaceBackend{alive: true},
+		ArtifactRoot: artifactRoot, AllowedCWDRoots: []string{cwd}, Adapters: map[string]harnesses.Adapter{"pi": piadapter.Adapter{}},
+	}
+	job, err := store.Create(ctx, protocol.CreateJob{IdempotencyKey: "settlement-publication-retry", Harness: "pi", Host: "host", Prompt: "go", CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []protocol.State{protocol.Starting, protocol.Running} {
+		if err = store.Record(ctx, protocol.EventBatch{Events: []protocol.ObservedEvent{{ID: fmt.Sprintf("publication-retry-state-%d", i), JobID: job.ID, State: state}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job.Artifacts.Directory = filepath.Join(artifactRoot, job.Artifacts.ID)
+	if err = os.MkdirAll(job.Artifacts.Directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	events := filepath.Join(job.Artifacts.Directory, "events.jsonl")
+	line := fmt.Sprintf(`{"type":"settled","ts":%d,"verdict":"done","summary":"retry me"}`+"\n", time.Now().UnixMilli())
+	if err = os.WriteFile(events, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = registry.Put(Worker{
+		Job: job, Launch: harnesses.Launch{Events: events}, Session: "job-live", Target: "w:p", LastState: protocol.Running,
+		GenerationStartedAt: time.Now().Add(-time.Second), GenerationCursor: 0, StartedAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = s.observe(ctx); err == nil {
+		t.Fatal("first settlement publication unexpectedly succeeded")
+	}
+	first := registry.Snapshot()[job.ID]
+	if first.ObservationCursor != int64(len(line)) || !first.SettledAt.IsZero() || !s.terminalPending(job.ID) {
+		t.Fatalf("failed publication did not preserve exact retry candidate: %#v pending=%t", first, s.terminalPending(job.ID))
+	}
+	if err = s.observe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != protocol.Done || got.Settlement == nil || got.Settlement.Summary != "retry me" {
+		t.Fatalf("settlement retry lost terminal content: %#v", got)
+	}
+	if final := registry.Snapshot()[job.ID]; final.SettledAt.IsZero() || s.terminalPending(job.ID) {
+		t.Fatalf("successful retry did not settle/clear candidate: %#v pending=%t", final, s.terminalPending(job.ID))
 	}
 }
 

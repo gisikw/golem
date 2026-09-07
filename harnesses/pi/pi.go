@@ -639,6 +639,12 @@ func (Adapter) Observe(ctx context.Context, j protocol.Job, r *harnesses.Runtime
 					o.Settled = true
 					o.Verdict = mapVerdict(ev.Verdict)
 					o.Summary = ev.Summary
+					o.TerminalCursor = o.Cursor
+					if ev.Ts != 0 {
+						o.TerminalAt = at
+					} else {
+						o.TerminalAt = time.Time{}
+					}
 					if ev.Usage != nil {
 						o.Usage = &protocol.Usage{InputTokens: ev.Usage.Input, OutputTokens: ev.Usage.Output, CostMicros: int64(math.Round(ev.Usage.Cost * 1_000_000))}
 					}
@@ -650,6 +656,10 @@ func (Adapter) Observe(ctx context.Context, j protocol.Job, r *harnesses.Runtime
 				o.Terminate = true
 				o.Verdict = protocol.Failed
 				o.Summary = fmt.Sprintf("worker exhausted compaction budget after %d attempts", ev.Count)
+				o.TerminalCursor = o.Cursor
+				if ev.Ts != 0 {
+					o.TerminalAt = at
+				}
 			default:
 				h := sha256.Sum256(b)
 				msg := ev.Message

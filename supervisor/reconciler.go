@@ -79,8 +79,10 @@ type Supervisor struct {
 }
 
 type terminalCandidate struct {
-	target      string
-	observation harnesses.Observation
+	target              string
+	generationStartedAt time.Time
+	generationCursor    int64
+	observation         harnesses.Observation
 }
 
 func (s *Supervisor) log() *slog.Logger {
@@ -140,19 +142,114 @@ func (s *Supervisor) resumeWorker(ctx context.Context, w Worker, mode string) {
 		s.log().Warn("worker cannot resume", "job", w.Job.ID, "mode", mode, "error", err)
 		return
 	}
+
+	// Read pending side-channel records before creating another target. A
+	// successful completion is authoritative even though the old target has
+	// disappeared, and publishing it here avoids a duplicate resume. An ordinary
+	// failed record is ambiguous: Pi emits the same verdict during orderly Herdr
+	// shutdown, so it cannot be accepted at this boundary. Leave it unread; the
+	// generation boundary below will identify it without inspecting its summary.
+	if settled, inspectErr := s.settlePendingBeforeResume(ctx, a, &w); inspectErr != nil {
+		s.log().Warn("worker pre-resume observation failed", "job", w.Job.ID, "mode", mode, "error", inspectErr)
+		return
+	} else if settled {
+		return
+	}
+
 	launch, err := a.Resume(ctx, w.Job, w.Launch)
 	if err != nil {
 		s.log().Warn("worker cannot resume", "job", w.Job.ID, "mode", mode, "error", err)
 		return
 	}
+	generationCursor, err := sideChannelBoundary(launch.Events)
+	if err != nil {
+		s.log().Warn("worker cannot establish resume generation", "job", w.Job.ID, "mode", mode, "error", err)
+		return
+	}
+	generationStartedAt := time.Now().UTC()
 	session, target, err := s.Backend.Start(ctx, w.Job.ID, launch)
 	if err != nil {
 		s.log().Error("worker resume failed", "job", w.Job.ID, "mode", mode, "error", err)
 		return
 	}
-	w.Launch, w.Session, w.Target, w.StartedAt = launch, session, target, time.Now().UTC()
-	_ = s.Registry.Put(w)
+	w.Launch, w.Session, w.Target = launch, session, target
+	w.GenerationStartedAt, w.GenerationCursor = generationStartedAt, generationCursor
+	w.StartedAt = time.Now().UTC()
+	if err = s.Registry.Put(w); err != nil {
+		s.log().Error("worker resume registration failed", "job", w.Job.ID, "mode", mode, "error", err)
+		if teardownErr := s.Backend.Teardown(ctx, session, target); teardownErr != nil {
+			s.log().Warn("unregistered resumed worker teardown failed", "job", w.Job.ID, "error", teardownErr)
+		}
+		return
+	}
 	s.log().Info("worker resumed", "job", w.Job.ID, "mode", mode)
+}
+
+func sideChannelBoundary(path string) (int64, error) {
+	if path == "" {
+		return 0, nil
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// settlePendingBeforeResume preserves a completed old turn rather than
+// launching a duplicate. Failed is deliberately excluded: an ordinary failed
+// completion and Pi's orderly-shutdown failure are identical at this API
+// boundary. Exhaustion remains authoritative because Terminate is explicit
+// structured policy evidence, not a summary-string convention.
+func (s *Supervisor) settlePendingBeforeResume(ctx context.Context, a harnesses.Adapter, w *Worker) (bool, error) {
+	runtime := s.runtime(*w)
+	obs, err := a.Observe(ctx, w.Job, &runtime)
+	if err != nil {
+		return false, err
+	}
+	if !obs.Settled || obs.Verdict == protocol.Failed && !obs.Terminate {
+		return false, nil
+	}
+	for _, progress := range observationProgresses(obs) {
+		event := protocol.ObservedEvent{ID: progress.ID, JobID: w.Job.ID, Progress: progress, ObservedAt: time.Now().UTC()}
+		if err = s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
+			return false, err
+		}
+	}
+	if w.LastState == protocol.Starting {
+		if err = s.publishState(ctx, w, protocol.Running); err != nil {
+			return false, err
+		}
+	}
+	settlement, err := a.CollectSettlement(ctx, w.Job, w.Launch, obs)
+	if err != nil {
+		return false, err
+	}
+	if len(obs.Detail) > 0 {
+		settlement.Detail = obs.Detail
+	}
+	s.enrichSettlement(w.Job, settlement, obs)
+	event := protocol.ObservedEvent{ID: w.Job.ID + "-settlement", JobID: w.Job.ID, Settlement: settlement, ObservedAt: time.Now().UTC()}
+	if err = s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
+		return false, err
+	}
+	w.ObservationCursor = obs.Cursor
+	s.settleWorker(*w, settlement.At, settlement.State)
+	s.clearTerminal(w.Job.ID)
+	return true, nil
+}
+
+func observationProgresses(obs harnesses.Observation) []*protocol.Progress {
+	if len(obs.Progresses) != 0 {
+		return obs.Progresses
+	}
+	if obs.Progress != nil {
+		return []*protocol.Progress{obs.Progress}
+	}
+	return nil
 }
 
 func (s *Supervisor) Tick(ctx context.Context) error {
@@ -164,6 +261,10 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	} // existing workers are untouched
+	// Reap before recovery. Recovery can discover and publish a pending genuine
+	// completion; reaping that newly settled worker against this poll's stale
+	// nonterminal assignment would let Diff launch a duplicate in the same Tick.
+	s.reapExpired(ctx, time.Now())
 	// A current desired assignment authorizes recovery regardless of the
 	// disconnected deadline; the adapter must still provide honest resume.
 	local := s.Registry.Snapshot()
@@ -188,7 +289,6 @@ func (s *Supervisor) Tick(ctx context.Context) error {
 	for _, d := range poll.Assignments {
 		s.reassertTerminal(ctx, d.Job)
 	}
-	s.reapExpired(ctx, time.Now())
 	for _, a := range Diff(poll.Assignments, s.Registry.Snapshot()) {
 		switch a.Kind {
 		case Start:
@@ -336,11 +436,16 @@ func (s *Supervisor) start(ctx context.Context, j protocol.Job) error {
 		launch.Env = map[string]string{}
 	}
 	launch.Env["GOLEM_ARTIFACT_DIR"] = j.Artifacts.Directory
+	generationCursor, err := sideChannelBoundary(launch.Events)
+	if err != nil {
+		return err
+	}
+	generationStartedAt := time.Now().UTC()
 	session, target, err := s.Backend.Start(ctx, j.ID, launch)
 	if err != nil {
 		return err
 	}
-	w := Worker{Job: j, Launch: launch, Session: session, Target: target, RestartUntil: time.Now().Add(s.OfflineWindow), LastState: protocol.Starting, StartedAt: time.Now().UTC()}
+	w := Worker{Job: j, Launch: launch, Session: session, Target: target, RestartUntil: time.Now().Add(s.OfflineWindow), LastState: protocol.Starting, GenerationStartedAt: generationStartedAt, GenerationCursor: generationCursor, StartedAt: time.Now().UTC()}
 	if err = s.Registry.Put(w); err != nil {
 		return err
 	}
@@ -554,14 +659,22 @@ func (s *Supervisor) forget(ctx context.Context, id string) {
 // same signal to NotifyContext. A context check alone cannot distinguish that
 // ordering from a spontaneous substrate crash.
 //
-// Hold one terminal observation in daemon-local memory. If golemd remains up,
-// the next reconcile confirms and publishes it, preserving real completions
-// and crashes with one poll of latency. During orderly replacement there is no
-// next reconcile: the durable cursor has consumed the shutdown-only side event,
-// while the deliberately unsettled registry entry is resumed by the new daemon.
-// This is intentionally not persisted; persisting it would turn the old
-// daemon's shutdown evidence into a terminal decision after restart.
-func (s *Supervisor) holdHerdrTerminal(id, target string, obs harnesses.Observation) bool {
+// Hold an ambiguous failure observation in daemon-local memory. If golemd
+// remains up, the next reconcile confirms and publishes it, preserving crashes
+// with one poll of latency. Structured done/exhaustion can publish immediately,
+// but is held until that publication succeeds so cursor advancement cannot lose
+// retry content. Confirmation always observes again: side-channel bytes written
+// after the candidate supersede it. This matters
+// when a replacement daemon resumes a worker before observing a shutdown-only
+// record left by the old process; the resumed worker's running or settlement
+// record is newer evidence from the current target.
+//
+// During orderly replacement there is no next reconcile: the durable cursor
+// has consumed the shutdown-only side event, while the deliberately unsettled
+// registry entry is resumed by the new daemon. This is intentionally not
+// persisted; persisting it would turn the old daemon's shutdown evidence into
+// a terminal decision after restart.
+func (s *Supervisor) holdHerdrTerminal(id string, w Worker, obs harnesses.Observation) bool {
 	if s.Backend.Policy().Name != "herdr" {
 		return false
 	}
@@ -570,18 +683,18 @@ func (s *Supervisor) holdHerdrTerminal(id, target string, obs harnesses.Observat
 	if s.terminalCandidates == nil {
 		s.terminalCandidates = make(map[string]terminalCandidate)
 	}
-	s.terminalCandidates[id] = terminalCandidate{target: target, observation: obs}
+	s.terminalCandidates[id] = terminalCandidate{target: w.Target, generationStartedAt: w.GenerationStartedAt, generationCursor: w.GenerationCursor, observation: obs}
 	return true
 }
 
-func (s *Supervisor) herdrTerminal(id, target string) (harnesses.Observation, bool) {
+func (s *Supervisor) herdrTerminal(id string, w Worker) (harnesses.Observation, bool) {
 	s.terminalMu.Lock()
 	defer s.terminalMu.Unlock()
 	candidate, ok := s.terminalCandidates[id]
 	if !ok {
 		return harnesses.Observation{}, false
 	}
-	if candidate.target != target {
+	if candidate.target != w.Target || !candidate.generationStartedAt.Equal(w.GenerationStartedAt) || candidate.generationCursor != w.GenerationCursor {
 		delete(s.terminalCandidates, id)
 		return harnesses.Observation{}, false
 	}
@@ -601,6 +714,31 @@ func (s *Supervisor) clearTerminal(id string) {
 	delete(s.terminalCandidates, id)
 }
 
+// terminalPredatesGeneration recognizes side-channel settlement bytes that
+// cannot belong to the current target. The cursor handles complete (and even
+// timestamp-less) records already present at launch. Event time closes the
+// narrow case where an old writer completes a record after the cursor snapshot
+// but before Backend.Start establishes the replacement target.
+func terminalPredatesGeneration(w Worker, obs harnesses.Observation) bool {
+	if !obs.Settled || w.GenerationStartedAt.IsZero() {
+		return false
+	}
+	if obs.TerminalCursor > 0 && obs.TerminalCursor <= w.GenerationCursor {
+		return true
+	}
+	return !obs.TerminalAt.IsZero() && obs.TerminalAt.Before(w.GenerationStartedAt)
+}
+
+func discardTerminal(obs *harnesses.Observation) {
+	obs.Settled = false
+	obs.Terminate = false
+	obs.Verdict = ""
+	obs.Summary = ""
+	obs.Usage = nil
+	obs.TerminalAt = time.Time{}
+	obs.TerminalCursor = 0
+}
+
 func (s *Supervisor) observe(ctx context.Context) error {
 	for id, w := range s.Registry.Snapshot() {
 		if !w.SettledAt.IsZero() {
@@ -611,12 +749,9 @@ func (s *Supervisor) observe(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		obs, confirming := s.herdrTerminal(id, w.Target)
-		var observeErr error
-		if !confirming {
-			runtime := s.runtime(w)
-			obs, observeErr = a.Observe(ctx, w.Job, &runtime)
-		}
+		candidate, confirming := s.herdrTerminal(id, w)
+		runtime := s.runtime(w)
+		obs, observeErr := a.Observe(ctx, w.Job, &runtime)
 		// Shutdown cancellation is not evidence about the worker. In particular,
 		// the owned Herdr child may disappear while Pane is being observed and
 		// honestly return absent rather than a context error. Preserve resumable
@@ -625,11 +760,7 @@ func (s *Supervisor) observe(ctx context.Context) error {
 			return ctx.Err()
 		}
 		if observeErr == nil {
-			progresses := obs.Progresses
-			if len(progresses) == 0 && obs.Progress != nil {
-				progresses = []*protocol.Progress{obs.Progress}
-			}
-			for _, progress := range progresses {
+			for _, progress := range observationProgresses(obs) {
 				event := protocol.ObservedEvent{ID: progress.ID, JobID: id, Progress: progress, ObservedAt: time.Now().UTC()}
 				if err = s.Client.Events(ctx, protocol.EventBatch{Host: s.Host, Events: []protocol.ObservedEvent{event}}); err != nil {
 					return err
@@ -640,6 +771,32 @@ func (s *Supervisor) observe(ctx context.Context) error {
 				if err = s.Registry.Put(w); err != nil {
 					return err
 				}
+			}
+		}
+		if observeErr == nil && terminalPredatesGeneration(w, obs) {
+			// Keep the cursor/progress from this scan, but terminal content from an
+			// older target has no authority over the live replacement generation.
+			discardTerminal(&obs)
+			s.clearTerminal(id)
+			confirming = false
+		}
+		if confirming {
+			if observeErr == nil && obs.Cursor > candidate.Cursor {
+				// The append-only side channel orders this observation after the
+				// candidate. A live observation cancels the candidate; a newer
+				// terminal observation replaces it before publication so a failed
+				// publication retries the right settlement on the next Tick.
+				if !obs.Settled && obs.State == protocol.Running {
+					s.clearTerminal(id)
+				} else {
+					s.holdHerdrTerminal(id, w, obs)
+				}
+			} else {
+				// No newer durable evidence arrived. Confirm exactly the held
+				// observation, including a spontaneous crash whose adapter check
+				// continues to fail and therefore has no side-channel cursor.
+				obs = candidate
+				observeErr = nil
 			}
 		}
 		// A worker keeps running when the adapter reports it alive (State Running)
@@ -720,7 +877,13 @@ func (s *Supervisor) observe(ctx context.Context) error {
 			detail, _ := json.Marshal(map[string]string{"failure_boundary": boundary})
 			obs.Detail = detail
 		}
-		if !confirming && s.holdHerdrTerminal(id, w.Target, obs) {
+		trustedSideSettlement := observeErr == nil && obs.Settled && (obs.Verdict != protocol.Failed || obs.Terminate)
+		if !confirming && trustedSideSettlement {
+			// Publish authoritative done/exhaustion immediately, but retain an
+			// in-memory copy until publication succeeds because the durable cursor
+			// was advanced above. The next Tick can therefore retry exact content.
+			s.holdHerdrTerminal(id, w, obs)
+		} else if !confirming && s.holdHerdrTerminal(id, w, obs) {
 			s.log().Info("herdr terminal observation awaiting confirmation", "job", id)
 			continue
 		}
