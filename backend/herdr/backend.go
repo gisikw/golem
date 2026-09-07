@@ -300,10 +300,7 @@ func (b *Backend) Start(ctx context.Context, id string, l harnesses.Launch) (str
 	// startup timeout rather than the caller's reconcile-tick context.
 	startCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.startupTimeout()+10*time.Second)
 	defer cancel()
-	err = b.call(startCtx, func(c *Conn) error {
-		_, e := c.AgentStart(startCtx, name, kind, pane.PaneID, args, timeout)
-		return e
-	})
+	err = b.startInNewPane(startCtx, name, kind, pane.PaneID, args, timeout)
 	if err != nil {
 		// The workspace exists but has no agent: close it so a retry does not
 		// leak one workspace per attempt.
@@ -326,6 +323,31 @@ func (b *Backend) Start(ctx context.Context, id string, l harnesses.Launch) (str
 	b.watch(pane.PaneID)
 	b.log().Info("herdr agent started", "job", id, "agent", name, "pane", pane.PaneID, "workspace", workspaceOf(pane.PaneID))
 	return name, pane.PaneID, nil
+}
+
+// startInNewPane bridges workspace creation and shell readiness. Herdr can
+// return a pane before its shell reaches the foreground prompt; agent.start's
+// timeout only covers readiness AFTER launch. Retry only its explicit pre-launch
+// busy rejection, in the SAME newly-created pane, under the startup deadline.
+// Never retry transport/ambiguous launch errors (which could duplicate an agent).
+func (b *Backend) startInNewPane(ctx context.Context, name, kind, pane string, args []string, timeout int) error {
+	for {
+		err := b.call(ctx, func(c *Conn) error {
+			_, e := c.AgentStart(ctx, name, kind, pane, args, timeout)
+			return e
+		})
+		var remote *Error
+		if !errors.As(err, &remote) || remote.Code != "agent_pane_busy" {
+			return err
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("waiting for new pane %s shell readiness: %w", pane, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 // closeWorkspace tears a workspace down on a cleanup path where the caller's
