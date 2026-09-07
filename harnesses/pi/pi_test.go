@@ -287,6 +287,38 @@ func TestConfiguredProviderProfile(t *testing.T) {
 	}
 }
 
+func TestDynamicTiamatProviderReachesWorker(t *testing.T) {
+	dir := t.TempDir()
+	a := Adapter{Binary: "fake-pi", Tiamat: true, Env: map[string]string{
+		"GOLEM_TIAMAT_URL": "https://router.example", "GOLEM_TIAMAT_TOKEN_FILE": "/run/secrets/router-token",
+	}}
+	j := protocol.Job{ID: "j", CWD: dir, Prompt: "p", Model: "tiamat-responses-astra%2Fnew/gpt-astra", Artifacts: protocol.ArtifactMetadata{Directory: dir}}
+	launch, err := a.Start(context.Background(), j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := os.ReadFile(filepath.Join(dir, "pi", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Extensions []string `json:"extensions"`
+		Enabled    []string `json:"enabledModels"`
+	}
+	if err = json.Unmarshal(settings, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Extensions) != 2 || !strings.HasSuffix(got.Extensions[1], "golem-tiamat/index.ts") {
+		t.Fatalf("dynamic extension absent: %#v", got.Extensions)
+	}
+	if len(got.Enabled) != 1 || got.Enabled[0] != j.Model {
+		t.Fatalf("dynamic model not enabled: %#v", got.Enabled)
+	}
+	if launch.Env["GOLEM_TIAMAT_TOKEN_FILE"] != "/run/secrets/router-token" || strings.Contains(string(settings), "router-token") {
+		t.Fatal("router token path leaked or was not isolated in environment")
+	}
+}
+
 func TestTiamatProviderUsesEmbeddedExtensionWithoutWorkerCredentials(t *testing.T) {
 	dir := t.TempDir()
 	a := Adapter{

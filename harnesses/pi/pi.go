@@ -68,7 +68,11 @@ type Adapter struct {
 	DefaultProvider string
 	DefaultModel    string
 	Providers       map[string]Provider
-	Env             map[string]string
+	// Tiamat permits resolver-authorized dynamic tiamat-{family}-{provider}
+	// IDs. The worker extension independently fetches the same catalogue and
+	// provisions the concrete provider without copying its token into artifacts.
+	Tiamat bool
+	Env    map[string]string
 }
 
 // Provider is operator-owned connection configuration. APIKeyEnv names a
@@ -214,7 +218,11 @@ func (a Adapter) writeWorkerProfile(dir, dispatchedModel string) error {
 		if !ok || provider == "" || model == "" {
 			return fmt.Errorf("pi model %q must be provider/model", dispatchedModel)
 		}
-		if configuredProvider, ok = a.Providers[provider]; !ok {
+		configuredProvider, ok = a.Providers[provider]
+		if !ok && a.Tiamat && dynamicTiamatProvider(provider) {
+			configuredProvider, ok = Provider{Kind: "tiamat"}, true
+		}
+		if !ok {
 			return fmt.Errorf("pi provider %q is not configured", provider)
 		}
 		configured = true
@@ -466,6 +474,15 @@ func (a Adapter) Resume(_ context.Context, j protocol.Job, l harnesses.Launch) (
 	l.Env = a.launchEnv(l.Events, wd, taskContext)
 	l.Interactive = true
 	return l, nil
+}
+
+func dynamicTiamatProvider(provider string) bool {
+	for _, family := range []string{"anthropic", "openai", "responses"} {
+		if strings.HasPrefix(provider, "tiamat-"+family+"-") && len(provider) > len("tiamat-"+family+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneEnv(src map[string]string) map[string]string {

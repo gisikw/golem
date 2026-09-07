@@ -91,6 +91,13 @@ type ProjectCapability struct {
 	Description string `json:"description,omitempty"`
 }
 
+type DiscoveryStatus struct {
+	Status      string    `json:"status"` // fresh or stale
+	RefreshedAt time.Time `json:"refreshed_at"`
+	// Error is deliberately bounded to a credential-free resolver summary.
+	Error string `json:"error,omitempty"`
+}
+
 type Capabilities struct {
 	Name         string                       `json:"name"`
 	Version      string                       `json:"version"`
@@ -98,6 +105,7 @@ type Capabilities struct {
 	Projects     []ProjectCapability          `json:"projects"`
 	CloneEnabled bool                         `json:"clone_enabled"`
 	AttachPort   int                          `json:"attach_port"`
+	Discovery    map[string]DiscoveryStatus   `json:"discovery,omitempty"`
 }
 
 const (

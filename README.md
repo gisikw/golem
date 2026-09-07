@@ -74,9 +74,10 @@ With no `--service`, the CLI uses `unix://~/.local/state/golem/golemd.sock`, mat
 `golemd --config PATH` requires TOML. It defines:
 
 - `name`: this daemon's identity
-- `[harnesses.<name>] models = [...]`: verbatim model IDs scoped to that harness
+- `[harnesses.<name>] models = [...]`: static verbatim model IDs scoped to that harness
 - `[projects.<name>]`: an absolute existing `path` and optional `description`
-- `[providers.<name>]`: pi `base_url` and optional `api_key_env`
+- `[providers.<name>]`: static pi `base_url` and optional `api_key_env`
+- `[tiamat]`: optional dynamic Pi catalogue discovery, with optional `providers` and exact advertised `models` restrictions plus bounded cache/timeout/size controls
 - `clone_enabled` (defaults false)
 - `api_bearer_tokens`: bearer credentials enforced on every TCP request; Unix sockets are exempt
 - `[attach_ssh]`: optional port, host key path, and authorized_keys path (port 0 disables it)
@@ -84,7 +85,11 @@ With no `--service`, the CLI uses `unix://~/.local/state/golem/golemd.sock`, mat
 
 Project paths and pi provider/model references are validated at startup. Dispatch selects either `--project NAME` or `--repo URL` plus `--worktree NAME`; the resulting `.golem/worktrees/NAME` is reused as the resume key. Repository cloning requires `clone_enabled`. Direct absolute `--cwd` remains a low-level test/fake-harness escape hatch.
 
-Provider descriptors and credentials are not accepted over the wire. For pi, `<provider>/<model>` resolves against operator config and `api_key_env` is read from golemd's own environment only while its private per-job profile is written.
+Provider descriptors and credentials are not accepted over the wire. For static pi providers, `<provider>/<model>` resolves against operator config and `api_key_env` is read from golemd's own environment only while its private per-job profile is written.
+
+Static `[providers.*] kind = "tiamat"` entries are rejected with a migration error; remove those duplicated provider blocks and their Tiamat entries from `harnesses.pi.models` when enabling `[tiamat]`.
+
+When `[tiamat]` is present, golemd reads the existing `GOLEM_TIAMAT_URL` and `GOLEM_TIAMAT_TOKEN_FILE` conventions and discovers compatible Anthropic Messages, OpenAI Completions, and OpenAI Responses records just in time. It ignores unsupported wires, rejects unavailable records, and advertises degraded records as usable. Advertisement and dispatch use the same bounded resolver. A refresh failure serves an explicitly `stale` catalogue (and HTTP `Warning: 110`) only through `stale_ttl`; without a usable cache, capabilities and dispatch return 503. The worker receives the token *path* in its environment and resolves the token at request time; neither token nor token contents enter API data or artifacts. See `golemd.example.toml` for controls and restriction syntax.
 
 Workers are host-native, not cosmetic sandboxes: they inherit golemd's Unix permissions, network, and development substrate. The Nix package wraps `golemd` with `nix`, `nix-shell`, and `nix-store` on `PATH`, so workers can use the host Nix daemon directly instead of rebuilding ad hoc tool environments. Deployments that require genuine isolation must use a separate namespace/VM boundary rather than hiding those commands from `PATH`.
 

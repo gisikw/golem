@@ -132,7 +132,7 @@ func main() {
 			piEnv[name] = value
 		}
 	}
-	piAdapter := piadapter.Adapter{Binary: *piBinary, HookExtension: os.Getenv("GOLEM_HOOK_EXTENSION"), WebExtension: os.Getenv("GOLEM_WEB_EXTENSION"), SourceProfile: env("GOLEM_PI_SOURCE_PROFILE", os.Getenv("PI_CODING_AGENT_DIR")), CopyAuth: os.Getenv("GOLEM_COPY_AUTH") == "1", DefaultProvider: os.Getenv("GOLEM_PI_DEFAULT_PROVIDER"), DefaultModel: os.Getenv("GOLEM_PI_DEFAULT_MODEL"), Providers: piProviders, Env: piEnv}
+	piAdapter := piadapter.Adapter{Binary: *piBinary, HookExtension: os.Getenv("GOLEM_HOOK_EXTENSION"), WebExtension: os.Getenv("GOLEM_WEB_EXTENSION"), SourceProfile: env("GOLEM_PI_SOURCE_PROFILE", os.Getenv("PI_CODING_AGENT_DIR")), CopyAuth: os.Getenv("GOLEM_COPY_AUTH") == "1", DefaultProvider: os.Getenv("GOLEM_PI_DEFAULT_PROVIDER"), DefaultModel: os.Getenv("GOLEM_PI_DEFAULT_MODEL"), Providers: piProviders, Env: piEnv, Tiamat: cfg.Tiamat != nil}
 	var claudeArgv []string
 	if os.Getenv("GOLEM_CLAUDE_ARGV") != "" {
 		claudeArgv = argvEnv("GOLEM_CLAUDE_ARGV", nil)
@@ -223,7 +223,20 @@ func main() {
 	if herdrBackend != nil {
 		caps.AttachPort, attachPort = 0, 0
 	}
-	api := service.API{Store: store, Capabilities: caps, Workspaces: workspaceResolver, PiProviders: providerNames, ArtifactRoot: *artifactRoot, Backend: runBackend.Policy()}
+	var capabilityResolver service.CapabilityResolver
+	if cfg.Tiamat != nil {
+		cacheTTL, staleTTL, timeout, _ := cfg.Tiamat.Durations()
+		capabilityResolver, err = service.NewDynamicCapabilityResolver(caps, providerNames, service.TiamatDiscoveryOptions{
+			BaseURL: os.Getenv("GOLEM_TIAMAT_URL"), TokenFile: os.Getenv("GOLEM_TIAMAT_TOKEN_FILE"),
+			AllowedProviders: cfg.Tiamat.Providers, AllowedModels: cfg.Tiamat.Models,
+			CacheTTL: cacheTTL, StaleTTL: staleTTL, Timeout: timeout,
+			MaxModels: cfg.Tiamat.MaxModels, MaxResponseBytes: cfg.Tiamat.MaxResponseBytes,
+		})
+		if err != nil {
+			exitAfterBackendFailure(runBackend, "tiamat discovery config", err)
+		}
+	}
+	api := service.API{Store: store, Capabilities: caps, Workspaces: workspaceResolver, PiProviders: providerNames, Resolver: capabilityResolver, ArtifactRoot: *artifactRoot, Backend: runBackend.Policy()}
 	servers, listeners, err := serve(api.Handler(), *socket, *listen, cfg.APIBearerTokens)
 	if err != nil {
 		exitAfterBackendFailure(runBackend, "listen", err)
